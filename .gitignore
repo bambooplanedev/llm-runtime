@@ -1,0 +1,4 @@
+.superpowers/
+target/
+*.gguf
+requests.jsonl

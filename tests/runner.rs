@@ -1,0 +1,207 @@
+use llmrt::config::Config;
+use llmrt::gguf::GgufMeta;
+use llmrt::inventory::LocalModel;
+use llmrt::runner::{ExecTarget, LoadOutcome, Runner};
+use llmrt::state::{Hw, ModelEntry, ModelState};
+use std::time::Duration;
+
+fn fake() -> String {
+    env!("CARGO_BIN_EXE_fake-llama-server").to_string()
+}
+
+fn cfg() -> Config {
+    std::env::set_var("LLMRT_FAST_TICK", "1");
+    let mut c = Config::load(None).unwrap();
+    c.llama_server = fake();
+    c.child_ports = (7600, 7603);
+    c.idle_timeout_secs = 1;
+    c.os_reserve_mb = Some(0);
+    c
+}
+
+fn lm(id: &str, need: u64) -> LocalModel {
+    LocalModel {
+        entry: ModelEntry {
+            id: id.into(),
+            file: format!("{id}.gguf"),
+            params_b: 1.0,
+            active_params_b: None,
+            need_mb: need,
+            state: ModelState::Available,
+            slots: 1,
+            inflight: 0,
+        },
+        path: format!("/tmp/{id}.gguf").into(),
+        meta: GgufMeta {
+            layers: 2,
+            kv_heads: 1,
+            head_dim: 8,
+            ..Default::default()
+        },
+    }
+}
+
+fn hw(limit: u64) -> Hw {
+    Hw {
+        cpu: "x".into(),
+        device: "CPU".into(),
+        mem_limit_mb: limit,
+    }
+}
+
+async fn wait_loaded(r: &Runner, id: &str) {
+    for _ in 0..100 {
+        if r.snapshot()
+            .0
+            .iter()
+            .any(|m| m.id == id && m.state == ModelState::Loaded)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{id} never loaded: {:?}", r.snapshot());
+}
+
+#[tokio::test]
+async fn load_then_exec_then_idle_stop() {
+    let r = Runner::new(
+        &cfg(),
+        hw(10_000),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    assert!(matches!(
+        r.load("a").await,
+        LoadOutcome::AlreadyLoadedOrLoading
+    ));
+    assert!(matches!(r.load("zzz").await, LoadOutcome::Unknown));
+    let (models, free) = r.snapshot();
+    assert_eq!(free, 9000, "loading already counts");
+    assert_eq!(
+        models.iter().find(|m| m.id == "a").unwrap().state,
+        ModelState::Loading
+    );
+    assert!(matches!(r.exec_target("a"), ExecTarget::NotLoaded));
+    wait_loaded(&r, "a").await;
+    let ExecTarget::Ready { port, guard } = r.exec_target("a") else {
+        panic!()
+    };
+    assert!((7600..=7603).contains(&port));
+    assert_eq!(
+        r.snapshot()
+            .0
+            .iter()
+            .find(|m| m.id == "a")
+            .unwrap()
+            .inflight,
+        1
+    );
+    drop(guard);
+    assert_eq!(
+        r.snapshot()
+            .0
+            .iter()
+            .find(|m| m.id == "a")
+            .unwrap()
+            .inflight,
+        0
+    );
+    // idle 1 s → draining → available
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let (models, free) = r.snapshot();
+    assert_eq!(
+        models.iter().find(|m| m.id == "a").unwrap().state,
+        ModelState::Available
+    );
+    assert_eq!(free, 10_000);
+    bg.abort();
+    r.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_memory_and_failed_load() {
+    // Own port range: tests run concurrently and the free-port probe binds optimistically.
+    let mut c = cfg();
+    c.child_ports = (7604, 7607);
+    let r = Runner::new(
+        &c,
+        hw(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    assert!(matches!(r.load("b").await, LoadOutcome::NoMemory));
+    wait_loaded(&r, "a").await;
+    bg.abort();
+    r.shutdown().await;
+
+    // Scoped to this child only: llama_cmd() splits on whitespace, so `env` becomes the program.
+    // A process-wide set_var would leak FAKE_DIE_ON_LOAD into the other tests running concurrently.
+    c.llama_server = format!("env FAKE_DIE_ON_LOAD=1 {}", fake());
+    let r = Runner::new(&c, hw(10_000), vec![lm("c", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("c").await, LoadOutcome::Accepted));
+    for _ in 0..100 {
+        if r.snapshot().0[0].state == ModelState::Failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(r.snapshot().0[0].state, ModelState::Failed);
+    assert_eq!(r.snapshot().1, 10_000, "failed holds no memory");
+    bg.abort();
+    r.shutdown().await;
+}
+
+/// A shutdown landing inside the background loop's `/health` poll must not leave a `Loaded` slot
+/// with no process: that ghost would charge `need_mb` forever and be unreachable by load, exec and
+/// the supervision loop alike. The loop is deliberately NOT aborted before the shutdown here.
+#[tokio::test]
+async fn shutdown_during_load_leaves_no_loaded_ghost() {
+    let mut c = cfg();
+    c.child_ports = (7608, 7609);
+    c.llama_server = format!("env FAKE_LOAD_MS=1500 {}", fake());
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    r.shutdown().await; // mid-load, with the loop still polling /health
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (models, free) = r.snapshot();
+    assert!(
+        matches!(models[0].state, ModelState::Available | ModelState::Failed),
+        "shutdown during load must not resurrect the slot: {models:?}"
+    );
+    assert!(
+        matches!(r.exec_target("a"), ExecTarget::NotLoaded),
+        "a slot with no process must never be an exec target"
+    );
+    assert_eq!(free, 10_000, "a killed child must stop charging need_mb");
+    bg.abort();
+}
+
+#[tokio::test]
+async fn pinned_start_on_boot_and_inflight_blocks_idle() {
+    let mut c = cfg();
+    c.pin = vec!["a".into()];
+    c.child_ports = (7610, 7613);
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    wait_loaded(&r, "a").await; // without an explicit load()
+    let ExecTarget::Ready { guard, .. } = r.exec_target("a") else {
+        panic!()
+    };
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        r.snapshot().0[0].state,
+        ModelState::Loaded,
+        "pinned with inflight>0 is not stopped"
+    );
+    drop(guard);
+    bg.abort();
+    r.shutdown().await;
+}
