@@ -13,6 +13,7 @@
 //! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
 //! - `FAKE_LIST_DEVICES_LOG` — append a line to this file on every `--list-devices`.
+//! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
 
 use axum::{
     extract::State,
@@ -40,6 +41,7 @@ struct App {
     ctx: u64,
     slots: u64,
     prefill_ms: u64,
+    chat_status: Option<u16>,
 }
 
 /// Value following `key`, or None. Unknown flags are simply never looked up.
@@ -110,6 +112,9 @@ async fn main() {
         ctx,
         slots,
         prefill_ms: env("FAKE_PREFILL_MS", 0),
+        chat_status: std::env::var("FAKE_CHAT_STATUS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
     };
     let router = Router::new()
         .route("/health", get(health))
@@ -163,6 +168,15 @@ async fn chat(
 ) -> axum::response::Response {
     if loading(&a) {
         return loading_err().into_response();
+    }
+    // Як справжній llama-server на задовгий промпт: звичайна HTTP-помилка і для stream.
+    if let Some(code) = a.chat_status {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({"error":{"code":code,
+                "message":"fake context exceeded","type":"exceed_context_size_error"}})),
+        )
+            .into_response();
     }
     if a.prefill_ms > 0 {
         tokio::time::sleep(Duration::from_millis(a.prefill_ms)).await;

@@ -675,3 +675,35 @@ fn joined_slow_start_falls_back_to_another_node() {
         "executed on B",
     );
 }
+
+/// spec 1.4: 4xx від llama.cpp — клієнту дослівно, і для stream, і без.
+#[test]
+fn llama_cpp_4xx_reaches_the_client_verbatim() {
+    let _s = serial();
+    let a = spawn_with(
+        7718,
+        "7772-7775",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            envs: &[("FAKE_CHAT_STATUS", "400")],
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    for stream in [false, true] {
+        let (code, body) = chat(a.port, "small", stream);
+        assert_eq!(code, 400, "stream={stream}: {body}");
+        assert!(
+            body.contains("exceed_context_size_error"),
+            "stream={stream}: {body}"
+        );
+    }
+    let log = std::fs::read_to_string(a.dir.path().join("data/requests.jsonl")).unwrap();
+    assert!(
+        log.lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .any(|r| r["status"] == 400 && r["error"] == "child 400"),
+        "{log}"
+    );
+}
