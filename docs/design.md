@@ -122,9 +122,11 @@ in step 1 and the hook for a future cascade. Tiers by `params_b`: `small < 3`, `
 `pick(cluster, request, exclude)`:
 
 1. Candidates: pairs (node, model) where the node is alive, `proto` matches, the pair is not in
-   `exclude`, the model is `loaded` or `available` and matches the tier or id.
-2. Drop `available` models where the node's `free_mb` is below `need_mb`.
-3. Sort: `loaded` before `available`, then more `params_b`, then fewer `inflight − slots`.
+   `exclude`, the model is `loaded`, `loading` or `available` and matches the tier or id.
+2. Drop `available` models where the node's `free_mb` is below `need_mb`. A `loading` model is
+   already counted in `free_mb` and is not dropped.
+3. Sort: `loaded`, then `loading` (join a cold start already under way), then `available`; then
+   more `params_b`, then fewer `inflight − slots`.
 4. Empty means `None`. Gateway returns `503` with the reason.
 
 `params_b` as the second key is the thesis: the best model within the requested effort, never
@@ -135,16 +137,28 @@ revision was removed as a weight without data.
 
 - Gateway calls `POST /exec` on the chosen node. `/exec` does not call `pick`. It goes straight
   to the local child, increments `inflight`, and proxies SSE as is. The local node is no exception.
-- For an `available` model gateway first calls `POST /load {model}`. `/load` is idempotent and
-  asynchronous: `202` for `available`, `loading`, or `loaded`; `409` only when memory is taken by
-  another model, with fresh `/state` as the body. Gateway waits for `loaded` by polling `/state`
-  once a second for at most `load_wait_secs`, then returns `503 "model loading, retry"`. Loading
-  continues on the node.
+- For an `available` or `loading` model gateway first calls `POST /load {model}` with a 30 s
+  timeout (on CUDA the node runs `--list-devices` before starting the child). `/load` is
+  idempotent and asynchronous: `202` for `available`, `loading`, or `loaded`; `409` when memory is
+  taken, `503` when the model is cooling down after a failure, the node could not start a process,
+  or the daemon is shutting down, both with fresh `/state` as the body. Gateway waits for `loaded`
+  by polling `/state` once a second for at most `load_wait_secs`. A missing or `draining` model
+  counts as failed. If the wait runs out on a load this request joined (`loading` at pick time),
+  the pair is excluded and `pick` runs again, so one slow start does not block the tier. If the
+  request started the load itself, it gets `503 "model loading, retry"` and loading continues on
+  the node.
 - `/exec` returns `409` if the model is no longer `loaded`, and `503` with the state as body if
   the child died before the first byte.
 - On `409` or `503` the pair goes into `exclude`, the snapshot updates from the body, and `pick`
   runs again. Connect refused or unreachable marks the node dead immediately. A read timeout does
   not. At most two retries, then `503`.
+- The gateway's HTTP client sets TCP keepalive explicitly (10 s idle, 5 s interval, 3 probes;
+  `TCP_USER_TIMEOUT` 25 s on Linux). A peer that vanishes without a reset, for example with Wi-Fi
+  off, is dropped in about 25 s on both OSes. Before the first byte the pair is excluded and
+  `pick` retried; after it the stream closes with `upstream_lost`.
+- A non-2xx answer from the child itself comes back from `/exec` as is, marked with
+  `x-llmrt-origin: child`. Gateway passes a 4xx to the client verbatim, retries a 503 on another
+  pair, and turns any other 5xx into `502 "upstream failed"` with the child's message in the log.
 - `/exec` always adds `stream_options.include_usage = true`. Without it `usage` in the stream is
   empty.
 - Once tokens have reached the client there is no retry. The stream closes with an error.
@@ -165,9 +179,13 @@ A node or model failure never becomes a network failure.
 | Different `proto` on one LAN | Nodes see each other, do not talk, warn once a minute |
 | Empty directory or corrupt GGUF | Node announces without the file, logs it |
 | `llama-server` not found | The only fatal error: exit 1 with the paths searched |
+| llama.cpp returns 4xx (for example `exceed_context_size_error`) | Passed to the client verbatim: status, body, content type |
+| llama.cpp returns 503 | Pair excluded, retry `pick` |
+| llama.cpp returns another 5xx | `502 "upstream failed"`, child's message in the log |
 
-Clients see only standard codes: `503` (nobody can serve), `502` (executor died), `400` (unknown
-`model`). Any OpenAI SDK works unchanged.
+Clients see standard codes: `503` (nobody can serve), `502` (executor died), `400` (unknown
+`model`), plus any 4xx that llama.cpp itself returns, such as a prompt longer than the context.
+Any OpenAI SDK works unchanged.
 
 ### Request log
 
@@ -190,21 +208,37 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
 - **Readiness.** `loading` while `GET /health` returns `503 "Loading model"` and the process is
   alive. No wall-clock limit: 20 GB on a slow disk outlasts any constant, and a limit would produce
   a kill → available → kill loop. A process that dies during load becomes `failed`, not
-  `available`, or the retry is guaranteed.
+  `available`, or the retry is guaranteed. A failed model returns to available after
+  `FAILED_COOLDOWN` (60 s), so a model that OOMs is retried at most once a minute rather than
+  never.
 - **`inflight`.** Incremented on `/exec` entry, decremented in a `Drop` guard that also closes the
   upstream connection. The guard lives in the response body, not the handler scope. Otherwise it
   fires when the handler returns, before the stream, and `inflight` is always 0.
-- **Idle.** A model idle longer than `idle_timeout_secs` goes `draining` under the same mutex as
-  `inflight`, then stops. Pinned models never stop.
-- **Health.** `GET /health` on every child every 5 s. A dead child goes back to `available` with
-  the exit signal logged. No automatic restart: after an OOM three retries would OOM three times.
+- **Idle.** The idle decision, the switch to `draining` and taking the process out happen under
+  the same mutex as `inflight`. The kill and wait run detached on a blocking thread, so a child
+  stuck in the GPU driver cannot freeze the node. `draining` is visible in `/state` while the
+  process exits, and the model is not picked then; with a single copy that is a brief `503`.
+  Pinned models never stop.
+- **Health.** While `loading`, `GET /health` every 5 s. For `loaded` children only process exit is
+  checked: llama-server answers `/health` from its HTTP thread and does not notice a hung
+  inference loop. A dead child goes back to `available` (`failed` if it died while loading) with
+  the exit status logged. Pinned models are reloaded by the background loop, at most once per
+  `FAILED_COOLDOWN` after any failed attempt.
+- **Rescan.** Every 30 s the daemon rescans `models_dir`. A new or changed file is used only when
+  its size and mtime match on two scans in a row, so a file still being copied is not announced.
+  A removed file drops its model once no process runs it; a changed file replaces the model once
+  it stops. A failing `read_dir` leaves the inventory as is. Replace model files with `mv`: the
+  running child has the old file mapped.
 - **Client disconnect.** The guard closes the upstream connection and `llama serve` cancels the
   task itself, also for non-stream requests.
 - **Orphans.** Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` in `pre_exec`. macOS has no equivalent,
   so at startup the daemon kills processes whose argv contains `--alias llmrt/<own node_id>/`.
   Other people's `llama-server` processes, Ollama, a second daemon in CI are untouched because the
   marker contains `node_id`.
-- **Shutdown.** `SIGTERM` stops all children through the process group.
+- **Shutdown.** `SIGTERM` or `SIGINT` starts axum's graceful shutdown; in-flight requests get up
+  to `SHUTDOWN_GRACE` (5 s) to finish before the daemon stops waiting on them, then
+  `runner.shutdown()` kills every child directly. Once shutdown begins, the node refuses new loads
+  (`/load` → `503`) and the background loop starts no new children, pinned ones included.
 
 ## 7. Configuration
 
@@ -212,8 +246,9 @@ One `llmrt.toml` per node, every field with a default. The field table is in the
 that are not obvious from the table:
 
 - `os_reserve_mb` defaults to 2048 on Metal and 1024 on CUDA.
-- `mem_limit_mb` overrides the `--list-devices` value. On a CPU-only build llama.cpp reports
-  0 MiB, and the fallback is all physical RAM.
+- `mem_limit_mb` overrides the `--list-devices` value on every device, with a warning when it is
+  above what the GPU reports; on CUDA real free VRAM still caps each load. On a CPU-only build
+  llama.cpp reports 0 MiB, and without `mem_limit_mb` the fallback is all physical RAM.
 - `llama_args` is where inventory reads `-c`, `-np`, `-ctk`, `-ctv` for `need_mb` and `slots`.
   `-np` is always passed explicitly. Without it `slots` is unknown.
 - Two daemons on one host need disjoint `child_ports` and separate `data_dir`. A shared
