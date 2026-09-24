@@ -33,6 +33,21 @@ impl Slot {
 /// Повтор завантаження моделі, що впала, — не частіше (spec 2.2). Раз на хвилину — не цикл OOM.
 pub const FAILED_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Чи зупиняти модель за простоєм (spec 2.4). Чиста: викликається під тим самим lock-ом,
+/// під яким слот переходить у `Draining` і віддає процес.
+pub fn should_idle_stop(
+    e: &ModelEntry,
+    last_used: Instant,
+    now: Instant,
+    idle: Duration,
+    pinned: bool,
+) -> bool {
+    e.state == ModelState::Loaded
+        && e.inflight == 0
+        && !pinned
+        && now.saturating_duration_since(last_used) > idle
+}
+
 /// Тести прискорюють такти через `LLMRT_FAST_TICK`.
 fn fast_tick() -> bool {
     std::env::var_os("LLMRT_FAST_TICK").is_some()
@@ -403,20 +418,51 @@ impl Runner {
                         }
                     }
                     ModelState::Loaded => {
-                        let idle_kill = {
-                            let g = self.0.lock().unwrap();
-                            let s = &g.slots[&id];
-                            s.model.entry.inflight == 0
-                                && !g.pin.contains(&id)
-                                && s.last_used.elapsed() > g.idle
-                        };
-                        if idle_kill {
-                            // Draining and the kill share one lock, so exec_target can never
-                            // hand out a port for a process that is about to die.
+                        // Рішення і забирання процесу — під одним lock-ом з exec_target: порт
+                        // процесу, що зараз помре, більше ніхто не отримає (spec 2.4).
+                        let taken = {
                             let mut g = self.0.lock().unwrap();
-                            g.slots.get_mut(&id).unwrap().model.entry.state = ModelState::Draining;
-                            g.kill(&id, ModelState::Available);
-                            tracing::info!("{id}: idle, stopped");
+                            let idle = g.idle;
+                            let pinned = g.pin.contains(&id);
+                            match g.slots.get_mut(&id) {
+                                Some(s)
+                                    if s.proc_.as_ref().map(|p| p.port) == Some(port)
+                                        && should_idle_stop(
+                                            &s.model.entry,
+                                            s.last_used,
+                                            Instant::now(),
+                                            idle,
+                                            pinned,
+                                        ) =>
+                                {
+                                    s.model.entry.state = ModelState::Draining;
+                                    s.proc_.take()
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(mut p) = taken {
+                            tracing::info!("{id}: idle, stopping");
+                            let runner = self.clone();
+                            let id = id.clone();
+                            // Detached: дитина в D-state (завислий драйвер GPU) не має заморозити
+                            // нагляд — cooldown, pins (spec 2.3). Пам'ять лишається зайнятою
+                            // (`used_mb` рахує Draining), доки wait не повернеться.
+                            tokio::spawn(async move {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = p.child.kill();
+                                    let _ = p.child.wait();
+                                })
+                                .await;
+                                // Зі стану Draining слот виводить лише ця задача або shutdown().
+                                let mut g = runner.0.lock().unwrap();
+                                if let Some(s) = g.slots.get_mut(&id) {
+                                    if s.model.entry.state == ModelState::Draining {
+                                        s.model.entry.state = ModelState::Available;
+                                        s.model.entry.inflight = 0;
+                                    }
+                                }
+                            });
                         }
                     }
                     _ => {}

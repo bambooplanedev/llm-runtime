@@ -1,9 +1,9 @@
 use llmrt::config::Config;
 use llmrt::gguf::GgufMeta;
 use llmrt::inventory::LocalModel;
-use llmrt::runner::{ExecTarget, LoadOutcome, Runner};
+use llmrt::runner::{should_idle_stop, ExecTarget, LoadOutcome, Runner};
 use llmrt::state::{Hw, ModelEntry, ModelState};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn fake() -> String {
     env!("CARGO_BIN_EXE_fake-llama-server").to_string()
@@ -255,4 +255,27 @@ async fn cuda_probe_runs_only_after_cheap_checks() {
         "positive control: a fitting model is probed once"
     );
     r.shutdown().await;
+}
+
+#[test]
+fn idle_stop_decision() {
+    let now = Instant::now();
+    let old = now.checked_sub(Duration::from_secs(10)).unwrap();
+    let idle = Duration::from_secs(5);
+    let mut e = lm("a", 1).entry;
+    e.state = ModelState::Loaded;
+    assert!(should_idle_stop(&e, old, now, idle, false));
+    assert!(
+        !should_idle_stop(&e, now, now, idle, false),
+        "recently used"
+    );
+    assert!(!should_idle_stop(&e, old, now, idle, true), "pinned");
+    e.inflight = 1;
+    assert!(!should_idle_stop(&e, old, now, idle, false), "in flight");
+    e.inflight = 0;
+    e.state = ModelState::Draining;
+    assert!(
+        !should_idle_stop(&e, old, now, idle, false),
+        "already stopping"
+    );
 }
