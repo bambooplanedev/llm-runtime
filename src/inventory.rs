@@ -192,12 +192,37 @@ pub fn total_ram_mb() -> Option<u64> {
     }
 }
 
+/// `mem_limit_mb` з конфігу перекриває `--list-devices` на будь-якому пристрої (spec 2.5).
+/// Більший за ліміт GPU — лише warning: на CUDA перед стартом дитини реально вільна VRAM
+/// однаково обмежує завантаження (`Runner::load`).
+pub fn resolve_mem_limit(reported_mb: u64, cfg_mb: Option<u64>) -> (u64, Option<String>) {
+    match cfg_mb {
+        Some(mb) if reported_mb > 0 && mb > reported_mb => (
+            mb,
+            Some(format!(
+                "mem_limit_mb = {mb} exceeds the {reported_mb} MiB the device reports; \
+                 on CUDA real free VRAM still caps each load"
+            )),
+        ),
+        Some(mb) => (mb, None),
+        None => (reported_mb, None),
+    }
+}
+
 /// §7: єдина фатальна помилка старту — llama.cpp не запускається. CPU-збірка без акселератора
 /// рапортує 0 MiB (`BLAS: Accelerate (0 MiB, …)`), і це не привід не стартувати: ліміт тоді
 /// або з конфігу, або вся фізична RAM (os_reserve_mb лишає ОС її шматок).
 pub fn probe_hw(cfg: &Config) -> anyhow::Result<Hw> {
     let text = list_devices_output(cfg)?;
     let mut hw = parse_list_devices(&text);
+    if hw.mem_limit_mb > 0 {
+        let (mb, warn) = resolve_mem_limit(hw.mem_limit_mb, cfg.mem_limit_mb);
+        if let Some(w) = warn {
+            tracing::warn!("{w}");
+        }
+        hw.mem_limit_mb = mb;
+        return Ok(hw);
+    }
     if hw.mem_limit_mb == 0 {
         hw.device = "CPU".into();
         hw.mem_limit_mb = match cfg.mem_limit_mb {
@@ -453,5 +478,23 @@ mod tests {
         let cuda = "Available devices:\n  CUDA0: NVIDIA RTX 3060 (12288 MiB, 9800 MiB free)\n";
         assert_eq!(parse_free_mb(cuda), Some(9800));
         assert_eq!(default_os_reserve(&parse_list_devices(cuda)), 1024);
+    }
+
+    #[test]
+    fn mem_limit_from_config_overrides_any_device() {
+        assert_eq!(resolve_mem_limit(12124, Some(8000)), (8000, None));
+        let (mb, warn) = resolve_mem_limit(12124, Some(20000));
+        assert_eq!(mb, 20000);
+        assert!(
+            warn.unwrap().contains("12124"),
+            "warning names the reported limit"
+        );
+        assert_eq!(resolve_mem_limit(12124, None), (12124, None));
+        assert_eq!(
+            resolve_mem_limit(0, Some(4096)),
+            (4096, None),
+            "CPU node: no device limit to compare"
+        );
+        assert_eq!(resolve_mem_limit(0, None), (0, None));
     }
 }
