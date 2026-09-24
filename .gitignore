@@ -2,3 +2,4 @@
 target/
 *.gguf
 requests.jsonl
+llmrt.toml

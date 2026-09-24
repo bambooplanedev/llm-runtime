@@ -259,6 +259,45 @@ async fn cuda_probe_runs_only_after_cheap_checks() {
     r.shutdown().await;
 }
 
+/// §4: reported free з `cudaMemGetInfo` уже без пам'яті ОС — `os_reserve_mb` віднімається лише
+/// від статичного бюджету. Числа з RTX 4070 Laptop, де подвійне віднімання давало 409.
+#[tokio::test]
+async fn cuda_reported_free_is_not_reduced_by_os_reserve() {
+    let mut c = cfg();
+    c.child_ports = (7628, 7628);
+    c.os_reserve_mb = Some(1024);
+    c.llama_server = format!("env FAKE_MEM_MB=7285 {}", fake());
+    let cuda = Hw {
+        cpu: "x".into(),
+        device: "CUDA0".into(),
+        mem_limit_mb: 7863,
+    };
+    let r = Runner::new(&c, cuda, vec![lm("a", 6441)], "n1".into());
+    let out = r.load("a").await;
+    assert!(
+        matches!(out, LoadOutcome::Accepted),
+        "6441 fits in min(7863 - 1024, 7285), got {out:?}"
+    );
+    r.shutdown().await;
+}
+
+/// Контроль до попереднього: реальна вільна пам'ять як і раніше обмежує завантаження.
+#[tokio::test]
+async fn cuda_reported_free_still_caps_load() {
+    let mut c = cfg();
+    c.child_ports = (7629, 7629);
+    c.os_reserve_mb = Some(1024);
+    c.llama_server = format!("env FAKE_MEM_MB=6400 {}", fake());
+    let cuda = Hw {
+        cpu: "x".into(),
+        device: "CUDA0".into(),
+        mem_limit_mb: 7863,
+    };
+    let r = Runner::new(&c, cuda, vec![lm("a", 6441)], "n1".into());
+    assert!(matches!(r.load("a").await, LoadOutcome::NoMemory));
+    r.shutdown().await;
+}
+
 /// F1: завислий CUDA-драйвер не має морозити нагляд — `load()` повертає `SpawnFailed` після
 /// `PROBE_TIMEOUT` (1 s під fast tick), а не висить, поки `--list-devices` колись відповість.
 #[tokio::test]

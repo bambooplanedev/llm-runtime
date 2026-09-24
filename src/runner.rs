@@ -445,7 +445,9 @@ impl Runner {
             return o;
         }
         if let Some(reported) = reported {
-            let free = g.free_mb().min(reported.saturating_sub(g.os_reserve_mb));
+            // reported уже без того, що зайняли ОС і чужі процеси: os_reserve_mb сидить у
+            // free_mb(), вдруге його не віднімаємо.
+            let free = g.free_mb().min(reported);
             if g.slots[id].model.entry.need_mb > free {
                 return LoadOutcome::NoMemory;
             }

@@ -106,7 +106,9 @@ One JSON document per node at `GET /state`:
   between `n_ctx × total_slots` and `-c`. That is the formula's test on real models.
 - **`free_mb`** = `mem_limit_mb − os_reserve_mb − Σ need_mb` of loaded and loading models. On
   CUDA it is additionally capped by free memory from `--list-devices`, which is real
-  `cudaMemGetInfo`. On Metal the reported free value is meaningless and unused.
+  `cudaMemGetInfo`. That value already excludes what the OS and other processes hold, so
+  `os_reserve_mb` is not subtracted from it a second time. On Metal the reported free value is
+  meaningless and unused.
 - **Model `state`**: `available`, `loading`, `loaded`, `draining`, `failed`.
 - **`slots`** is `-np`. `llama-server` queues requests above `-np`, so `inflight` alone does not
   mean busy.
