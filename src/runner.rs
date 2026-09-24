@@ -71,6 +71,8 @@ struct Inner {
     device: String,
     cfg: Config,
     failed_cooldown: Duration,
+    /// `true` once `shutdown()` started (§6): нових дітей більше не запускаємо, навіть pinned.
+    shutting_down: bool,
 }
 
 #[derive(Clone)]
@@ -86,6 +88,8 @@ pub enum LoadOutcome {
     CoolingDown,
     /// Не вдалося запустити процес (порти, fork) — біда вузла, модель лишається `Available`.
     SpawnFailed,
+    /// Демон зупиняється — нових дітей не запускаємо (§6).
+    ShuttingDown,
 }
 
 impl LoadOutcome {
@@ -98,6 +102,7 @@ impl LoadOutcome {
             LoadOutcome::Unknown => "unknown model",
             LoadOutcome::CoolingDown => "cooling down after a failure",
             LoadOutcome::SpawnFailed => "spawn failed",
+            LoadOutcome::ShuttingDown => "shutting down",
         }
     }
 }
@@ -234,6 +239,9 @@ impl Inner {
 
     /// Перевірки без I/O. `Ok(())` — можна вантажити (spec 1.2: до CUDA-проби і ще раз після).
     fn precheck(&self, id: &str) -> Result<(), LoadOutcome> {
+        if self.shutting_down {
+            return Err(LoadOutcome::ShuttingDown);
+        }
         let Some(s) = self.slots.get(id) else {
             return Err(LoadOutcome::Unknown);
         };
@@ -276,6 +284,7 @@ impl Runner {
             } else {
                 FAILED_COOLDOWN
             },
+            shutting_down: false,
         })))
     }
 
@@ -397,12 +406,19 @@ impl Runner {
                 let mut g = self.0.lock().unwrap();
                 let cooldown = g.failed_cooldown;
                 if let Some(s) = g.slots.get_mut(&p) {
-                    if out != LoadOutcome::Accepted {
+                    // AlreadyLoadedOrLoading: гонка з ручним /load, що встиг між збором `due` і
+                    // цим викликом — модель і так піднімається, це не привід для backoff/warn.
+                    let up = matches!(
+                        out,
+                        LoadOutcome::Accepted | LoadOutcome::AlreadyLoadedOrLoading
+                    );
+                    if !up {
                         s.pin_retry_at = Some(Instant::now() + cooldown);
                     }
                     if s.pin_last != Some(out.as_str()) {
                         match out {
                             LoadOutcome::Accepted => tracing::info!("pinned {p} starting"),
+                            LoadOutcome::AlreadyLoadedOrLoading => {}
                             _ => tracing::warn!(
                                 "pinned {p}: {}, retry in {cooldown:?}",
                                 out.as_str()
@@ -586,6 +602,9 @@ impl Runner {
         let mut procs: Vec<Child> = Vec::new();
         {
             let mut g = self.0.lock().unwrap();
+            // Під тим самим lock-ом, де беремо дітей: тик, що зазирне сюди хоч на мить пізніше,
+            // мусить побачити прапорець і не заспавнити нову дитину, яку ніхто вже не вб'є (§6).
+            g.shutting_down = true;
             for s in g.slots.values_mut() {
                 if let Some(p) = s.proc_.take() {
                     procs.push(p.child);

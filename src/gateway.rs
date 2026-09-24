@@ -97,8 +97,9 @@ async fn load(State(gw): State<Gateway>, Json(r): Json<LoadReq>) -> Response {
             StatusCode::ACCEPTED.into_response()
         }
         LoadOutcome::NoMemory => (StatusCode::CONFLICT, Json(local_state(&gw))).into_response(),
-        // Модель у cooldown або вузол не зміг запустити процес: викликач виключить пару.
-        LoadOutcome::CoolingDown | LoadOutcome::SpawnFailed => {
+        // Модель у cooldown, вузол не зміг запустити процес, або демон зупиняється:
+        // викликач виключить пару.
+        LoadOutcome::CoolingDown | LoadOutcome::SpawnFailed | LoadOutcome::ShuttingDown => {
             (StatusCode::SERVICE_UNAVAILABLE, Json(local_state(&gw))).into_response()
         }
         LoadOutcome::Unknown => StatusCode::NOT_FOUND.into_response(),

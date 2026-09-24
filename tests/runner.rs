@@ -287,6 +287,15 @@ async fn pinned_child_killed_externally_comes_back() {
         ModelState::Loaded,
         "death must be noticed"
     );
+    // Backoff: cooldown — 1 s під fast tick, тож 500 мс по смерті модель ще не пробує вантажитись.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !matches!(
+            r.snapshot().0[0].state,
+            ModelState::Loading | ModelState::Loaded
+        ),
+        "pin must not retry before FAILED_COOLDOWN"
+    );
     wait_loaded(&r, "a").await; // cooldown 1 s + завантаження
     bg.abort();
     r.shutdown().await;
@@ -320,6 +329,28 @@ async fn pinned_that_does_not_fit_backs_off() {
         attempts, 2,
         "one retry per cooldown, not per tick and not never"
     );
+    bg.abort();
+}
+
+/// §6: a tick landing inside the shutdown window must not respawn a pinned model — shutdown()
+/// never kills a child that starts after it already took the old ones (orphan, no PDEATHSIG on
+/// macOS).
+#[tokio::test]
+async fn shutdown_blocks_new_spawns_even_for_pins() {
+    let mut c = cfg();
+    c.pin = vec!["a".into()];
+    c.child_ports = (7620, 7620);
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    wait_loaded(&r, "a").await;
+    r.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // кілька тактів (fast tick 200 ms)
+    let st = r.snapshot().0[0].state;
+    assert!(
+        !matches!(st, ModelState::Loading | ModelState::Loaded),
+        "shutdown must not let a pin respawn: {st:?}"
+    );
+    assert_eq!(r.load("a").await, LoadOutcome::ShuttingDown);
     bg.abort();
 }
 
