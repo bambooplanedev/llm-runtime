@@ -458,6 +458,56 @@ async fn merge_scan_rules() {
     r.shutdown().await;
 }
 
+/// F2: dangerous cells of the spec 2.7 merge table that `merge_scan_rules` did not cover.
+#[tokio::test]
+async fn merge_scan_gone_but_busy_stays_and_failed_reset_on_replace() {
+    // Cell: file gone from the new scan (not even in `keep`), but a process is still running
+    // (Loaded) → the slot must stay untouched, not be treated as "removed".
+    let mut c = cfg();
+    c.child_ports = (7624, 7625);
+    let r = Runner::new(&c, hw(10_000), vec![lm("run", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("run").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "run").await;
+    r.merge_scan(vec![], &HashSet::new());
+    let (models, _) = r.snapshot();
+    assert_eq!(
+        models.iter().find(|m| m.id == "run").unwrap().state,
+        ModelState::Loaded,
+        "file gone but process running → slot stays (spec 2.7)"
+    );
+    bg.abort();
+    r.shutdown().await;
+
+    // Cell: a Failed slot whose fingerprint changed → after merge it is Available again
+    // (a replacement resets Failed, it does not wait out the cooldown).
+    let mut c2 = cfg();
+    c2.child_ports = (7626, 7627);
+    c2.llama_server = format!("env FAKE_DIE_ON_LOAD=1 {}", fake());
+    let r2 = Runner::new(&c2, hw(10_000), vec![lm("fails", 1000)], "n1".into());
+    let bg2 = tokio::spawn(r2.clone().run_background());
+    assert!(matches!(r2.load("fails").await, LoadOutcome::Accepted));
+    for _ in 0..100 {
+        if r2.snapshot().0[0].state == ModelState::Failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(r2.snapshot().0[0].state, ModelState::Failed);
+    // Abort the background loop first: under LLMRT_FAST_TICK the cooldown is 1 s and would
+    // otherwise race the assertion below back to Available on its own.
+    bg2.abort();
+    let mut replacement = lm("fails", 2000);
+    replacement.fingerprint = vec![("/tmp/fails-v2.gguf".into(), 2, std::time::UNIX_EPOCH)];
+    r2.merge_scan(vec![replacement], &HashSet::new());
+    assert_eq!(
+        r2.snapshot().0[0].state,
+        ModelState::Available,
+        "replacement resets Failed, does not wait out the cooldown"
+    );
+    r2.shutdown().await;
+}
+
 #[test]
 fn idle_stop_decision() {
     let now = Instant::now();

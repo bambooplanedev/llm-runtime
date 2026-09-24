@@ -132,10 +132,19 @@ pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io:
         // сортується першим і група «нешардований + шард» інакше подвоїла б розмір.
         let expect = parts[0].1.split_count.map_or(1, |c| c as usize);
         if parts.len() != expect {
-            out.warnings.push((
-                fp_key,
-                format!("{id}: {} of {expect} shards present, skipped", parts.len()),
-            ));
+            // F6: split_count відсутній, а файлів кілька — це не «частина шардів», а id-колізія
+            // (напр. `Foo-1B.gguf` і `Foo-1B-copy.gguf` дали той самий `model_id`): назвати файли.
+            let msg = if parts[0].1.split_count.is_none() && parts.len() > 1 {
+                let names = parts
+                    .iter()
+                    .map(|x| x.0.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{id}: several files map to the same model id ({names}), skipped")
+            } else {
+                format!("{id}: {} of {expect} shards present, skipped", parts.len())
+            };
+            out.warnings.push((fp_key, msg));
             out.keep.insert(id);
             continue;
         }
@@ -486,6 +495,19 @@ mod tests {
         assert!(
             !got.iter().any(|m| m.entry.id == "mixed-1b"),
             "змішана група мусить бути пропущена"
+        );
+        // F6: split_count == None і кілька файлів на один id — це колізія id, не «частина шардів»;
+        // текст попередження мусить це називати, а не «k of 1 shards present».
+        let out = scan_dir(dir.path(), &a, None).unwrap();
+        let mixed_warn = out
+            .warnings
+            .iter()
+            .find(|(_, w)| w.starts_with("mixed-1b:"))
+            .unwrap_or_else(|| panic!("no warning for mixed-1b: {:?}", out.warnings));
+        assert!(
+            mixed_warn.1.contains("same model id"),
+            "got: {}",
+            mixed_warn.1
         );
         assert!(
             !got.iter().any(|m| m.entry.id == "bad-1b"),
