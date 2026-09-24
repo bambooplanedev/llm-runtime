@@ -10,8 +10,12 @@
 //! - `FAKE_TOKENS` (5)      — stream chunk count, 50 ms apart.
 //! - `FAKE_PREFILL_MS` (0)  — pause before the first chunk (prefill).
 //! - `FAKE_DIE_MID_STREAM=1`— exit(4) after 2 chunks.
-//! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..}` on start.
+//! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..,"pid":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
+//! - `FAKE_LIST_DEVICES_LOG` — append a millisecond timestamp line to this file on every `--list-devices`.
+//! - `FAKE_LIST_DEVICES_SLEEP_MS` — sleep this long in the `--list-devices` branch before printing
+//!   (after the log line above), to simulate a wedged driver (F1).
+//! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
 
 use axum::{
     extract::State,
@@ -26,7 +30,7 @@ use axum::{
 use futures_util::stream;
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone)]
@@ -39,6 +43,7 @@ struct App {
     ctx: u64,
     slots: u64,
     prefill_ms: u64,
+    chat_status: Option<u16>,
 }
 
 /// Value following `key`, or None. Unknown flags are simply never looked up.
@@ -52,6 +57,26 @@ fn arg(args: &[String], key: &str) -> Option<String> {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list-devices") {
+        // Тести рахують виклики проби: кожен виклик — рядок у файлі.
+        if let Ok(p) = std::env::var("FAKE_LIST_DEVICES_LOG") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let _ = writeln!(f, "{ms}");
+            }
+        }
+        if let Ok(ms) = std::env::var("FAKE_LIST_DEVICES_SLEEP_MS") {
+            if let Ok(ms) = ms.parse() {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+        }
         let mem = std::env::var("FAKE_MEM_MB").unwrap_or_else(|_| "16384".into());
         println!(
             "Available devices:\n  MTL0: Fake M4 ({mem} MiB, {mem} MiB free)\n  BLAS: Accelerate (0 MiB, 0 MiB free)"
@@ -86,7 +111,7 @@ async fn main() {
         .unwrap_or(1)
         .max(1);
     if let Ok(p) = std::env::var("FAKE_MODEL_JSON") {
-        let j = serde_json::json!({"alias": &alias, "model": model, "port": port});
+        let j = serde_json::json!({"alias": &alias, "model": model, "port": port, "pid": std::process::id()});
         std::fs::write(p, j.to_string()).ok();
     }
     let app = App {
@@ -98,6 +123,9 @@ async fn main() {
         ctx,
         slots,
         prefill_ms: env("FAKE_PREFILL_MS", 0),
+        chat_status: std::env::var("FAKE_CHAT_STATUS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
     };
     let router = Router::new()
         .route("/health", get(health))
@@ -151,6 +179,15 @@ async fn chat(
 ) -> axum::response::Response {
     if loading(&a) {
         return loading_err().into_response();
+    }
+    // Як справжній llama-server на задовгий промпт: звичайна HTTP-помилка і для stream.
+    if let Some(code) = a.chat_status {
+        return (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(serde_json::json!({"error":{"code":code,
+                "message":"fake context exceeded","type":"exceed_context_size_error"}})),
+        )
+            .into_response();
     }
     if a.prefill_ms > 0 {
         tokio::time::sleep(Duration::from_millis(a.prefill_ms)).await;

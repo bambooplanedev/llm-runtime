@@ -14,7 +14,7 @@ use crate::state::{now_secs, Cluster, Hw, ModelState, NodeState, NodeView, PROTO
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -27,12 +27,18 @@ use std::time::{Duration, Instant};
 
 /// Таймаут службових запитів до сусіда (§3).
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
+/// `/load` на CUDA спершу запускає `--list-devices` — 2 s `PEER_TIMEOUT` замало (spec 1.2).
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Генерація може тривати довго; це запобіжник, а не бюджет (§5).
 const EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Максимум два повтори `pick` (§5).
 const MAX_RETRIES: u32 = 2;
 /// Ліміт тіла запиту: довгий промпт легко перебиває дефолтні 2 МБ axum.
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
+/// Маркер відповіді самої дитини на `/exec`: відрізняє її від власних 409/404/503 вузла (spec 1.4).
+pub const ORIGIN_HEADER: &str = "x-llmrt-origin";
+/// Тіло помилки дитини буферизується не більше цього.
+const ERR_BODY_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -91,6 +97,11 @@ async fn load(State(gw): State<Gateway>, Json(r): Json<LoadReq>) -> Response {
             StatusCode::ACCEPTED.into_response()
         }
         LoadOutcome::NoMemory => (StatusCode::CONFLICT, Json(local_state(&gw))).into_response(),
+        // Модель у cooldown, вузол не зміг запустити процес, або демон зупиняється:
+        // викликач виключить пару.
+        LoadOutcome::CoolingDown | LoadOutcome::SpawnFailed | LoadOutcome::ShuttingDown => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(local_state(&gw))).into_response()
+        }
         LoadOutcome::Unknown => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -119,14 +130,20 @@ async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
         .await;
     let up = match up {
         Ok(u) if u.status().is_success() => u,
+        // Відповідь самої дитини (напр. 400 «контекст переповнено»): як є, з маркером.
         Ok(u) => {
-            let code = u.status().as_u16();
             drop(guard);
-            return (
-                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(local_state(&gw)),
-            )
-                .into_response();
+            let status =
+                StatusCode::from_u16(u.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = u.headers().get(header::CONTENT_TYPE).cloned();
+            let body = read_capped(u, ERR_BODY_LIMIT).await;
+            let mut resp = (status, body).into_response();
+            resp.headers_mut()
+                .insert(ORIGIN_HEADER, HeaderValue::from_static("child"));
+            if let Some(ct) = ct {
+                resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+            }
+            return resp;
         }
         // Дитина померла до першого байта: віддаємо стан, викликач виключить нас і піде далі.
         Err(_) => {
@@ -211,6 +228,62 @@ pub enum Retry {
     MarkDeadAndRetry,
     RetryOnly,
     GiveUp,
+}
+
+/// Тіло помилки — не більше `limit` байт: дитина може віддати що завгодно.
+async fn read_capped(u: reqwest::Response, limit: usize) -> Bytes {
+    let mut out = Vec::new();
+    let mut s = u.bytes_stream();
+    while let Some(Ok(c)) = s.next().await {
+        let room = limit - out.len();
+        out.extend_from_slice(&c[..c.len().min(room)]);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Bytes::from(out)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChildErr {
+    PassThrough,
+    Retry,
+    BadGateway,
+}
+
+/// Не-2xx від самої дитини (з маркером `ORIGIN_HEADER`).
+pub fn classify_child(code: u16) -> ChildErr {
+    match code {
+        503 => ChildErr::Retry,
+        400..=499 => ChildErr::PassThrough,
+        _ => ChildErr::BadGateway,
+    }
+}
+
+/// 4xx від llama.cpp — клієнту дослівно: `exceed_context_size_error` його SDK зрозуміє краще за 502.
+/// `give_up` не годиться: він завжди формує власне тіло.
+async fn pass_through(
+    gw: &Gateway,
+    mut rec: Record,
+    started: Instant,
+    u: reqwest::Response,
+) -> Response {
+    let code = u.status().as_u16();
+    let ct = u.headers().get(header::CONTENT_TYPE).cloned();
+    let body = read_capped(u, ERR_BODY_LIMIT).await;
+    rec.status = code;
+    rec.error = Some(format!("child {code}"));
+    rec.wall_ms = started.elapsed().as_millis() as u64;
+    gw.log.write(&rec);
+    let mut resp = (
+        StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+        body,
+    )
+        .into_response();
+    if let Some(ct) = ct {
+        resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    resp
 }
 
 pub fn classify(e: UpstreamErr) -> Retry {
@@ -303,11 +376,17 @@ async fn wait_loaded(gw: &Gateway, pick: &Pick) -> Loaded {
             if !local {
                 Discovery::ingest(&gw.disc.cluster, st.clone(), &pick.addr);
             }
-            if let Some(m) = st.models.iter().find(|m| m.id == pick.pair.model_id) {
-                match m.state {
-                    ModelState::Loaded => return Loaded::Yes,
-                    ModelState::Failed | ModelState::Available => return Loaded::Failed,
-                    _ => {}
+            match st
+                .models
+                .iter()
+                .find(|m| m.id == pick.pair.model_id)
+                .map(|m| m.state)
+            {
+                Some(ModelState::Loaded) => return Loaded::Yes,
+                Some(ModelState::Loading) => {}
+                // Відсутня (перескан прибрав файл), зупиняється, впала — цей вузол не відповість.
+                None | Some(ModelState::Failed | ModelState::Available | ModelState::Draining) => {
+                    return Loaded::Failed
                 }
             }
         }
@@ -425,7 +504,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             let r = gw
                 .http
                 .post(format!("http://{}/load", pick.addr))
-                .timeout(PEER_TIMEOUT)
+                .timeout(LOAD_TIMEOUT)
                 .json(&serde_json::json!({"model": pick.pair.model_id}))
                 .send()
                 .await;
@@ -438,13 +517,20 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
                             exclude.insert(pick.pair.clone());
                             continue;
                         }
-                        // Завантаження триває далі; клієнт хай спробує ще раз.
+                        // Приєдналися до чужого старту, а він не встиг: пробуємо інший вузол,
+                        // щоб один повільний старт не блокував тир для всіх (spec 1.3).
+                        Loaded::Pending if pick.joined => {
+                            exclude.insert(pick.pair.clone());
+                            continue;
+                        }
+                        // Старт почали ми: завантаження триває, клієнт хай спробує ще раз.
                         Loaded::Pending => {
                             return give_up(&gw, rec, started, 503, "model loading, retry")
                         }
                     }
                 }
-                // 409 (немає пам'яті) чи 404 (немає такої моделі) — вузол не годиться.
+                // 409 (немає пам'яті), 404 (немає такої моделі) чи 503 (cooldown, spawn failed
+                // чи демон зупиняється) — вузол не годиться.
                 Ok(resp) => {
                     ingest_body(&gw, resp, &pick).await;
                     exclude.insert(pick.pair.clone());
@@ -473,6 +559,23 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             Ok(u) if u.status().is_success() => u,
             Ok(u) => {
                 let code = u.status().as_u16();
+                if u.headers().get(ORIGIN_HEADER).is_some_and(|v| v == "child") {
+                    match classify_child(code) {
+                        ChildErr::Retry => {
+                            exclude.insert(pick.pair.clone());
+                            continue;
+                        }
+                        ChildErr::PassThrough => return pass_through(&gw, rec, started, u).await,
+                        ChildErr::BadGateway => {
+                            let body = read_capped(u, ERR_BODY_LIMIT).await;
+                            // Символи, не байти: зріз по байтах панікує на UTF-8.
+                            let text: String =
+                                String::from_utf8_lossy(&body).chars().take(200).collect();
+                            rec.error = Some(format!("child {code}: {text}"));
+                            return give_up(&gw, rec, started, 502, "upstream failed");
+                        }
+                    }
+                }
                 match classify(UpstreamErr::Status(code)) {
                     Retry::RetryOnly => {
                         ingest_body(&gw, u, &pick).await;
@@ -598,5 +701,14 @@ mod tests {
         assert_eq!(no_pick_status(crate::planner::NoPick::UnknownModel).0, 400);
         assert_eq!(no_pick_status(crate::planner::NoPick::NoSuchTier).0, 503);
         assert_eq!(no_pick_status(crate::planner::NoPick::AllBusy).0, 503);
+    }
+
+    #[test]
+    fn child_errors_pass_through_retry_or_502() {
+        assert_eq!(classify_child(400), ChildErr::PassThrough);
+        assert_eq!(classify_child(413), ChildErr::PassThrough);
+        // 503 у llama-server — «вантажиться/недоступний»: інший вузол може відповісти.
+        assert_eq!(classify_child(503), ChildErr::Retry);
+        assert_eq!(classify_child(500), ChildErr::BadGateway);
     }
 }

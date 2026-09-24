@@ -43,6 +43,9 @@ llama --version               # newer builds expose the server as `llama serve`
 cargo build --release         # produces ./target/release/llmrt
 ```
 
+See [docs/setup.md](docs/setup.md) for a full multi-machine setup (macOS + Linux/CUDA), networking
+and troubleshooting.
+
 ## Configuration
 
 `llmrt.toml` is optional. Every field has a default. A minimal file:
@@ -52,7 +55,7 @@ port = 7411
 models_dir = "~/models"
 llama_server = "llama serve"           # default: `llama-server` if on PATH, else `llama serve`
 llama_args = ["-c", "4096", "-np", "1"] # default: ["-c", "8192", "-np", "1"]
-mem_limit_mb = 32768                   # default: from `--list-devices`; all physical RAM on CPU-only nodes
+mem_limit_mb = 32768                   # default: from --list-devices; overrides it on any device; all physical RAM on CPU-only nodes
 ```
 
 | Field | Default | Purpose |
@@ -65,11 +68,11 @@ mem_limit_mb = 32768                   # default: from `--list-devices`; all phy
 | `llama_args` | `["-c","8192","-np","1"]` | Extra arguments for every child |
 | `peers` | `[]` | Seed list of `host:port` when mDNS is unavailable |
 | `os_reserve_mb` | 2048 Metal / 1024 CUDA | Memory kept free for the OS |
-| `mem_limit_mb` | from `--list-devices` | Hard memory cap for loaded models |
+| `mem_limit_mb` | from `--list-devices` | Memory cap for loaded models; overrides the device value |
 | `load_wait_secs` | `120` | How long to wait for a child to become ready |
 | `idle_timeout_secs` | `600` | Unload a model after this much idle time |
 | `tiers` | `{ small = 3.0, medium = 12.0 }` | Tier boundaries in billions of parameters |
-| `pin` | `[]` | Model ids to load at startup and never unload |
+| `pin` | `[]` | Model ids to keep loaded; reloaded after a crash |
 | `data_dir` | `~/.llmrt` | Holds `node_id` and `requests.jsonl` |
 
 Full semantics are in
@@ -80,7 +83,8 @@ Full semantics are in
 Start the daemon on every machine:
 
 ```bash
-./target/release/llmrt ./llmrt.toml   # omit the argument to use all defaults
+./target/release/llmrt ./llmrt.toml   # or --config ./llmrt.toml; omit to use all defaults
+./target/release/llmrt --help
 ```
 
 Nodes discover each other over mDNS within the LAN. If multicast is blocked, or two daemons share a
@@ -128,8 +132,9 @@ One JSON line per request (executing node, tokens, TTFT, tokens/s) is appended t
 - **Working over the internet or a VPN.** One LAN only.
 - **Authentication or encryption.** See Limitations.
 - **Evicting models.** A model that does not fit gets `503`. The idle timeout frees memory.
-- **Restarting crashed children.** A crashed model goes back to `available`. The next request
-  reloads it. After an OOM, three retries would OOM three times.
+- **Restarting crashed children on the spot.** A crashed model goes back to available and the next
+  request reloads it. A model that failed to load waits a 60 s cooldown. Pinned models are
+  reloaded automatically.
 - **Managing GPU/CPU layer placement.** llama.cpp b10826 enables `--fit` by default. llmrt does not
   pass `-ngl`.
 - **Performance tuning.** No data yet. The only exception is a warning about silent swapping,
@@ -143,4 +148,5 @@ cargo fmt && cargo clippy
 ```
 
 Integration tests in `tests/` spawn real daemons with `fake-llama-server` and cover routing by
-tier, peer death, memory pressure, orphan cleanup, and client disconnect.
+tier, peer death, memory pressure, orphan cleanup, client disconnect, joining a cold start,
+llama.cpp errors, rescans, and the CLI.

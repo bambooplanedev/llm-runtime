@@ -11,6 +11,7 @@ pub struct GgufMeta {
     pub params: u64,
     pub expert_count: Option<u64>,
     pub expert_used: Option<u64>,
+    pub full_attention_interval: Option<u64>,
     pub split_no: Option<u16>,
     pub split_count: Option<u16>,
     pub file_size: u64,
@@ -153,6 +154,7 @@ pub fn read_meta(path: &Path) -> Result<GgufMeta> {
         .unwrap_or(0);
     m.expert_count = num("expert_count");
     m.expert_used = num("expert_used_count");
+    m.full_attention_interval = num("full_attention_interval");
     m.split_no = num("split.no").map(|v| v as u16);
     m.split_count = num("split.count").map(|v| v as u16);
     for _ in 0..n_tensors {
@@ -166,7 +168,9 @@ pub fn read_meta(path: &Path) -> Result<GgufMeta> {
         r.u64()?;
         m.params = m.params.saturating_add(n);
     }
-    if m.layers == 0 {
+    // Шарди 2..N від llama-gguf-split несуть лише split.* і tensor-info: метадані моделі —
+    // тільки в першому. Для них layers == 0 — норма, перевіряє групу `inventory::scan`.
+    if m.layers == 0 && m.split_no.unwrap_or(0) == 0 {
         bail!("gguf without block_count: {}", path.display());
     }
     Ok(m)
@@ -211,14 +215,59 @@ mod tests {
         assert_eq!(m.expert_used, None);
     }
 
+    /// Гібрид (qwen35/qwen3next): KV-кеш лише в кожному N-му шарі.
+    #[test]
+    fn reads_full_attention_interval() {
+        let f = fixture(&[
+            "--arch",
+            "qwen35",
+            "--layers",
+            "32",
+            "--full-attention-interval",
+            "4",
+        ]);
+        let m = read_meta(f.path()).unwrap();
+        assert_eq!(m.full_attention_interval, Some(4));
+        let plain = read_meta(fixture(&["--layers", "4"]).path()).unwrap();
+        assert_eq!(plain.full_attention_interval, None);
+    }
+
     #[test]
     fn reads_split_and_moe() {
-        let f = fixture(&["--split", "2/3", "--experts", "128", "--experts-used", "8"]);
+        // expert-ключі є лише в першому шарді — як у llama-gguf-split
+        let f = fixture(&["--split", "1/3", "--experts", "128", "--experts-used", "8"]);
         let m = read_meta(f.path()).unwrap();
-        assert_eq!(m.split_no, Some(1));
+        assert_eq!(m.split_no, Some(0));
         assert_eq!(m.split_count, Some(3));
         assert_eq!(m.expert_count, Some(128));
         assert_eq!(m.expert_used, Some(8));
+    }
+
+    /// Шард 2..N від llama-gguf-split: лише split.* і tensor-info, без block_count (spec 2.1).
+    #[test]
+    fn secondary_shard_without_metadata_is_ok() {
+        let f = fixture(&[
+            "--split",
+            "2/3",
+            "--layers",
+            "3",
+            "--params-per-layer",
+            "1000000",
+        ]);
+        let m = read_meta(f.path()).unwrap();
+        assert_eq!(m.split_no, Some(1));
+        assert_eq!(m.split_count, Some(3));
+        assert_eq!(m.layers, 0);
+        assert_eq!(m.params, 3 * 1000 * 1000);
+    }
+
+    /// --no-tensor-first-split: метадані є, тензорів нуль.
+    #[test]
+    fn first_shard_without_tensors_is_ok() {
+        let f = fixture(&["--split", "1/2", "--no-tensors", "--layers", "4"]);
+        let m = read_meta(f.path()).unwrap();
+        assert_eq!(m.layers, 4);
+        assert_eq!(m.params, 0);
     }
 
     #[test]

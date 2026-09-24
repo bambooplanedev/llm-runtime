@@ -1,6 +1,7 @@
-//! Демон `llmrt [шлях/до/llmrt.toml]`: конфіг → node_id → probe → сироти →
+//! Демон `llmrt [PATH | --config PATH]`: конфіг → node_id → probe → сироти →
 //! скан моделей → runner → discovery → лог → gateway (§1–§7).
 
+use clap::Parser;
 use llmrt::{
     config::Config,
     discovery::Discovery,
@@ -9,7 +10,20 @@ use llmrt::{
     reqlog::ReqLog,
     runner::Runner,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Turn several machines on one LAN into a single OpenAI-compatible inference endpoint.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Path to llmrt.toml; every field has a default when omitted
+    #[arg(value_name = "PATH", conflicts_with = "config")]
+    path: Option<PathBuf>,
+    /// Path to llmrt.toml (same as the positional PATH)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
 
 /// Скільки чекати на з'єднання, що ще в польоті, після сигналу. Довга генерація
 /// має власний таймаут у годину (`EXEC_TIMEOUT`), тож без цієї межі SIGTERM
@@ -38,13 +52,14 @@ async fn stop_signal() {
 // (`/load`, `/exec`) прямо з обробника — на current_thread це був би дедлок.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llmrt=info")),
         )
         .init();
-    let path = std::env::args().nth(1).map(std::path::PathBuf::from);
+    let path = cli.config.or(cli.path);
     let cfg = Arc::new(Config::load(path.as_deref())?);
     std::fs::create_dir_all(&cfg.data_dir)?;
 
@@ -70,7 +85,15 @@ async fn main() -> anyhow::Result<()> {
     Runner::kill_orphans(&node_id);
 
     let args = cfg.parse_llama_args();
-    let models = inventory::scan(&cfg.models_dir, &args);
+    // Стартовий скан дає і моделі, і кеш — з ним перескан не перечитує заголовки (spec 2.7).
+    let scanned = inventory::scan_dir(&cfg.models_dir, &args, None).unwrap_or_else(|e| {
+        tracing::warn!("models_dir {} not readable: {e}", cfg.models_dir.display());
+        inventory::ScanOut::default()
+    });
+    for (_, w) in &scanned.warnings {
+        tracing::warn!("{w}");
+    }
+    let models = scanned.models;
     tracing::info!(
         "node {node_id} ({}) device {} limit {} MB, {} models",
         cfg.name,
@@ -83,10 +106,20 @@ async fn main() -> anyhow::Result<()> {
     let disc = Discovery::new(node_id.clone(), cfg.port, cfg.peers.clone());
     let log = Arc::new(ReqLog::open(&cfg.data_dir.join("requests.jsonl"))?);
     // Без глобального таймауту: генерація триває скільки треба, і кожен виклик
-    // ставить власний (`PEER_TIMEOUT`/`EXEC_TIMEOUT` у gateway).
-    let http = reqwest::Client::builder()
+    // ставить власний (`PEER_TIMEOUT`/`LOAD_TIMEOUT`/`EXEC_TIMEOUT` у gateway).
+    // Keepalive — явно (spec 1.1): дефолти reqwest 0.13.5 (15 s / 15 s / 3, на Linux ще
+    // TCP_USER_TIMEOUT 30 s) дають ~60 s на macOS і ~30 s на Linux до виявлення вузла, що зник
+    // без RST (вимкнений Wi-Fi). Тут ~25 s на обох. Живий вузол підтверджує проби ядром навіть
+    // посеред довгого prefill, тож легітимні запити не обриваються.
+    let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
-        .build()?;
+        .tcp_keepalive(std::time::Duration::from_secs(10))
+        .tcp_keepalive_interval(std::time::Duration::from_secs(5))
+        .tcp_keepalive_retries(3);
+    // На Linux TCP_USER_TIMEOUT перекриває лічильник проб — ставимо його під ті самі ~25 s.
+    #[cfg(target_os = "linux")]
+    let builder = builder.tcp_user_timeout(std::time::Duration::from_secs(25));
+    let http = builder.build()?;
     let gw = Gateway {
         cfg: cfg.clone(),
         runner: runner.clone(),
@@ -97,7 +130,12 @@ async fn main() -> anyhow::Result<()> {
         http,
     };
 
-    tokio::spawn(runner.clone().run_background()); // pinned стартують тут, до announce (§3)
+    tokio::spawn(runner.clone().run_background()); // нагляд за дітьми; pinned стартують на першому такті циклу (spec 2.6)
+    tokio::spawn(
+        runner
+            .clone()
+            .run_rescan(cfg.models_dir.clone(), args, scanned.cache),
+    );
     tokio::spawn(disc.run());
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port)).await?;
     tracing::info!("gateway on :{}", cfg.port);
