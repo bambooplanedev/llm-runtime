@@ -325,8 +325,31 @@ pub fn parse_free_mb(out: &str) -> Option<u64> {
     })
 }
 
-pub fn probe_free_mb(cfg: &Config) -> Option<u64> {
-    parse_free_mb(&list_devices_output(cfg).ok()?)
+/// F1: `--list-devices` завис (заглухлий драйвер) — таймаут спрацював раніше, ніж процес відповів.
+pub struct ProbeTimedOut;
+
+/// F1: асинхронна проба вільної VRAM з таймаутом, щоб завислий CUDA-драйвер не морозив нагляд
+/// (`Runner::load`, викликається з pin-проходу `run_background`). `kill_on_drop` прибирає процес,
+/// якщо таймаут спрацював раніше за завершення. Помилка запуску (не таймаут) — як і раніше,
+/// `None`: проба просто нічого не дала, це не біда вузла.
+pub async fn probe_free_mb_async(
+    cfg: &Config,
+    timeout: std::time::Duration,
+) -> Result<Option<u64>, ProbeTimedOut> {
+    let mut cmd = tokio::process::Command::from(cfg.llama_cmd());
+    cmd.arg("--list-devices").kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(out)) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(parse_free_mb(&text))
+        }
+        Ok(Err(_)) => Ok(None),
+        Err(_) => Err(ProbeTimedOut),
+    }
 }
 
 pub fn default_os_reserve(hw: &Hw) -> u64 {

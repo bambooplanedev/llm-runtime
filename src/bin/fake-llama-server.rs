@@ -13,6 +13,8 @@
 //! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..,"pid":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
 //! - `FAKE_LIST_DEVICES_LOG` — append a millisecond timestamp line to this file on every `--list-devices`.
+//! - `FAKE_LIST_DEVICES_SLEEP_MS` — sleep this long in the `--list-devices` branch before printing
+//!   (after the log line above), to simulate a wedged driver (F1).
 //! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
 
 use axum::{
@@ -68,6 +70,11 @@ async fn main() {
                     .unwrap()
                     .as_millis();
                 let _ = writeln!(f, "{ms}");
+            }
+        }
+        if let Ok(ms) = std::env::var("FAKE_LIST_DEVICES_SLEEP_MS") {
+            if let Ok(ms) = ms.parse() {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
             }
         }
         let mem = std::env::var("FAKE_MEM_MB").unwrap_or_else(|_| "16384".into());

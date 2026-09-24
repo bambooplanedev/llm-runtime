@@ -54,6 +54,9 @@ pub const RESCAN_EVERY: Duration = Duration::from_secs(30);
 /// Повтор завантаження моделі, що впала, — не частіше (spec 2.2). Раз на хвилину — не цикл OOM.
 pub const FAILED_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// F1: скільки чекати на CUDA-пробу (`--list-devices`), перш ніж уважати драйвер завислим.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Чи зупиняти модель за простоєм (spec 2.4). Чиста: викликається під тим самим lock-ом,
 /// під яким слот переходить у `Draining` і віддає процес.
 pub fn should_idle_stop(
@@ -86,6 +89,8 @@ struct Inner {
     device: String,
     cfg: Config,
     failed_cooldown: Duration,
+    /// F1: таймаут CUDA-проби; `PROBE_TIMEOUT`, під `LLMRT_FAST_TICK` — 1 s, як `failed_cooldown`.
+    probe_timeout: Duration,
     /// `true` once `shutdown()` started (§6): нових дітей більше не запускаємо, навіть pinned.
     shutting_down: bool,
 }
@@ -299,6 +304,11 @@ impl Runner {
             } else {
                 FAILED_COOLDOWN
             },
+            probe_timeout: if fast_tick() {
+                Duration::from_secs(1)
+            } else {
+                PROBE_TIMEOUT
+            },
             shutting_down: false,
         })))
     }
@@ -401,19 +411,31 @@ impl Runner {
     /// тривати секунди, і для моделі, що однаково не влізе, вона марна. `spawn` лишається
     /// синхронним і на воркері (див. PDEATHSIG у `spawn`).
     pub async fn load(&self, id: &str) -> LoadOutcome {
-        let probe_cfg = {
+        let probe = {
             let g = self.0.lock().unwrap();
             if let Err(o) = g.precheck(id) {
                 return o;
             }
-            g.device.starts_with("CUDA").then(|| g.cfg.clone())
+            g.device
+                .starts_with("CUDA")
+                .then(|| (g.cfg.clone(), g.device.clone(), g.probe_timeout))
         };
         // §4: на CUDA reported free враховує чужі процеси; на Metal воно безглузде.
-        let reported = match probe_cfg {
-            Some(cfg) => tokio::task::spawn_blocking(move || crate::inventory::probe_free_mb(&cfg))
-                .await
-                .ok()
-                .flatten(),
+        // F1: асинхронно, з таймаутом — завислий драйвер не має морозити pin-прохід у
+        // `run_background`, що чекає саме на цей `.await`.
+        let reported = match probe {
+            Some((cfg, device, timeout)) => {
+                match crate::inventory::probe_free_mb_async(&cfg, timeout).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!(
+                            "--list-devices on {device} did not finish within {timeout:?}; \
+                             treating as a node problem (spawn failed)"
+                        );
+                        return LoadOutcome::SpawnFailed;
+                    }
+                }
+            }
             None => None,
         };
 

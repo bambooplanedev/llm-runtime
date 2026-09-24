@@ -259,6 +259,39 @@ async fn cuda_probe_runs_only_after_cheap_checks() {
     r.shutdown().await;
 }
 
+/// F1: завислий CUDA-драйвер не має морозити нагляд — `load()` повертає `SpawnFailed` після
+/// `PROBE_TIMEOUT` (1 s під fast tick), а не висить, поки `--list-devices` колись відповість.
+#[tokio::test]
+async fn cuda_probe_timeout_returns_spawn_failed() {
+    let mut c = cfg();
+    c.child_ports = (7623, 7623);
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=20000 {}", fake());
+    let cuda = Hw {
+        cpu: "x".into(),
+        device: "CUDA0".into(),
+        mem_limit_mb: 10_000,
+    };
+    let r = Runner::new(&c, cuda, vec![lm("a", 1000)], "n1".into());
+    // Тестовий запобіжник: якщо реалізація ще без таймауту, це RED-невдача, а не зависання.
+    let out = tokio::time::timeout(Duration::from_secs(10), r.load("a"))
+        .await
+        .expect("load() must return within the probe timeout, not hang forever");
+    assert!(matches!(out, LoadOutcome::SpawnFailed));
+    assert_eq!(r.snapshot().0[0].state, ModelState::Available);
+    // kill_on_drop мусить реально прибрати заглухлий процес проби.
+    for _ in 0..40 {
+        let ps = std::process::Command::new("pgrep")
+            .args(["-f", "fake-llama-server --list-devices"])
+            .output()
+            .unwrap();
+        if ps.stdout.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fake-llama-server --list-devices still running after kill_on_drop");
+}
+
 /// spec 2.6: pinned-модель, чию дитину вбито ззовні, повертається сама.
 #[tokio::test]
 async fn pinned_child_killed_externally_comes_back() {
