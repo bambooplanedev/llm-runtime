@@ -529,7 +529,8 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
                         }
                     }
                 }
-                // 409 (немає пам'яті) чи 404 (немає такої моделі) — вузол не годиться.
+                // 409 (немає пам'яті), 404 (немає такої моделі) чи 503 (cooldown, spawn failed
+                // чи демон зупиняється) — вузол не годиться.
                 Ok(resp) => {
                     ingest_body(&gw, resp, &pick).await;
                     exclude.insert(pick.pair.clone());

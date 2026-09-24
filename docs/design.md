@@ -63,8 +63,9 @@ gateway → planner → discovery → inventory. Only gateway knows about HTTP.
   `node_id → NodeInfo + load + last_seen`. Three misses in a row mark a node dead. Dead nodes keep
   being polled every 10 s, because a node that never restarted will not re-announce itself.
 - **runner.** Manages local `llama-server` children: start on demand, health, stop after idle.
-  One process per model. Owns memory accounting and `inflight`. Pinned models start at daemon
-  startup, sequentially, before the mDNS announce.
+  One process per model. Owns memory accounting and `inflight`. Pinned models are loaded by the
+  background loop from its first tick, concurrently with discovery, and reloaded after a crash at
+  most once per `FAILED_COOLDOWN`.
 - **gateway.** One HTTP port. For peers: `GET /state`, `POST /load`, `POST /exec`. For users:
   `/v1/chat/completions`, `/v1/models`. Calls the planner, proxies the stream, writes the log.
 
@@ -228,7 +229,9 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
   its size and mtime match on two scans in a row, so a file still being copied is not announced.
   A removed file drops its model once no process runs it; a changed file replaces the model once
   it stops. A failing `read_dir` leaves the inventory as is. Replace model files with `mv`: the
-  running child has the old file mapped.
+  running child has the old file mapped. This two-scan stabilization is a *rescan* rule only: the
+  startup scan has no previous scan to compare against, so every file present at startup is taken
+  as is on the first read. Do not start the daemon while a model file is still being copied.
 - **Client disconnect.** The guard closes the upstream connection and `llama serve` cancels the
   task itself, also for non-stream requests.
 - **Orphans.** Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` in `pre_exec`. macOS has no equivalent,

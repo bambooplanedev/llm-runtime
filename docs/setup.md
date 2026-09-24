@@ -46,6 +46,10 @@ The daemon rescans the directory every 30 s. A new file appears once its size ha
 changing between two scans. **Replace a model with `mv`, not by copying over it**: a running
 `llama-server` has the old file memory-mapped, and overwriting it in place can crash that child.
 
+This stabilization check only applies to *rescans*. At startup there is no previous scan to
+compare against, so every file present is taken as is immediately. Don't start the daemon while a
+model file is still being copied into `models_dir`.
+
 ## 4. Configure each node
 
 `llmrt.toml` is optional; every field has a default. Examples:
@@ -55,6 +59,7 @@ changing between two scans. **Replace a model with `mv`, not by copying over it*
 ```toml
 name = "mac-m4"
 models_dir = "~/models"
+child_ports = "7500-7531"
 llama_args = ["-c", "8192", "-np", "1"]
 pin = ["qwen3-1.7b-q4_k_m"]      # keep a small model always loaded
 ```
@@ -65,6 +70,7 @@ pin = ["qwen3-1.7b-q4_k_m"]      # keep a small model always loaded
 name = "linux-4070"
 models_dir = "~/models"
 llama_server = "llama-server"
+child_ports = "7500-7531"
 llama_args = ["-c", "8192", "-np", "2"]
 mem_limit_mb = 11264              # leave headroom for the desktop / other GPU users
 ```
