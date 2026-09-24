@@ -17,6 +17,10 @@ struct Slot {
     last_used: Instant,
     /// Коли модель стала `Failed`; фоновий цикл повертає її в `Available` після cooldown.
     failed_at: Option<Instant>,
+    /// Наступна спроба перезапуску pinned-моделі; `None` — можна пробувати вже зараз (spec 2.6).
+    pin_retry_at: Option<Instant>,
+    /// Останній результат pin-спроби — щоб не спамити лог однаковим попередженням щотакту.
+    pin_last: Option<&'static str>,
 }
 
 impl Slot {
@@ -26,6 +30,8 @@ impl Slot {
             proc_: None,
             last_used: Instant::now(),
             failed_at: None,
+            pin_retry_at: None,
+            pin_last: None,
         }
     }
 }
@@ -80,6 +86,20 @@ pub enum LoadOutcome {
     CoolingDown,
     /// Не вдалося запустити процес (порти, fork) — біда вузла, модель лишається `Available`.
     SpawnFailed,
+}
+
+impl LoadOutcome {
+    /// Для логу pins: пишемо лише коли результат змінився (spec 2.6).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadOutcome::Accepted => "accepted",
+            LoadOutcome::AlreadyLoadedOrLoading => "already loaded or loading",
+            LoadOutcome::NoMemory => "no memory",
+            LoadOutcome::Unknown => "unknown model",
+            LoadOutcome::CoolingDown => "cooling down after a failure",
+            LoadOutcome::SpawnFailed => "spawn failed",
+        }
+    }
 }
 
 pub enum ExecTarget {
@@ -195,6 +215,8 @@ impl Inner {
     }
 
     fn kill(&mut self, id: &str, next: ModelState) {
+        let pinned = self.pin.iter().any(|p| p == id);
+        let cooldown = self.failed_cooldown;
         if let Some(s) = self.slots.get_mut(id) {
             if let Some(mut p) = s.proc_.take() {
                 let _ = p.child.kill();
@@ -203,6 +225,10 @@ impl Inner {
             s.model.entry.state = next;
             s.model.entry.inflight = 0;
             s.failed_at = (next == ModelState::Failed).then(Instant::now);
+            // Pinned-дитина померла: перезапуск — не раніше cooldown, а не на наступному такті.
+            if pinned {
+                s.pin_retry_at = Some(Instant::now() + cooldown);
+            }
         }
     }
 
@@ -325,10 +351,10 @@ impl Runner {
     /// Health + idle, once every 5 s (§6); tests tick faster via `LLMRT_FAST_TICK`.
     pub async fn run_background(self) {
         let tick = Duration::from_millis(if fast_tick() { 200 } else { 5000 });
-        let pins: Vec<String> = self.0.lock().unwrap().pin.clone();
-        for p in pins {
-            if let LoadOutcome::Accepted = self.load(&p).await {
-                tracing::info!("pinned {p} starting");
+        {
+            let g = self.0.lock().unwrap();
+            for p in g.pin.iter().filter(|p| !g.slots.contains_key(*p)) {
+                tracing::warn!("pin {p}: no such model in models_dir (yet)");
             }
         }
         let http = reqwest::Client::builder()
@@ -347,6 +373,42 @@ impl Runner {
                         s.model.entry.state = ModelState::Available;
                         s.failed_at = None;
                         tracing::info!("{}: cooldown over, available again", s.model.entry.id);
+                    }
+                }
+            }
+            // Pins: Available → load, з backoff після будь-якого не-Accepted (spec 2.6).
+            // Тут, на async-воркері, а не в spawn_blocking — spawn дитини мусить іти з воркера.
+            let due: Vec<String> = {
+                let g = self.0.lock().unwrap();
+                let now = Instant::now();
+                g.pin
+                    .iter()
+                    .filter(|p| {
+                        g.slots.get(*p).is_some_and(|s| {
+                            s.model.entry.state == ModelState::Available
+                                && s.pin_retry_at.is_none_or(|t| now >= t)
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            };
+            for p in due {
+                let out = self.load(&p).await;
+                let mut g = self.0.lock().unwrap();
+                let cooldown = g.failed_cooldown;
+                if let Some(s) = g.slots.get_mut(&p) {
+                    if out != LoadOutcome::Accepted {
+                        s.pin_retry_at = Some(Instant::now() + cooldown);
+                    }
+                    if s.pin_last != Some(out.as_str()) {
+                        match out {
+                            LoadOutcome::Accepted => tracing::info!("pinned {p} starting"),
+                            _ => tracing::warn!(
+                                "pinned {p}: {}, retry in {cooldown:?}",
+                                out.as_str()
+                            ),
+                        }
+                        s.pin_last = Some(out.as_str());
                     }
                 }
             }

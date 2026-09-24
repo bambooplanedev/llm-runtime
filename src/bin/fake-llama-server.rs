@@ -10,7 +10,7 @@
 //! - `FAKE_TOKENS` (5)      — stream chunk count, 50 ms apart.
 //! - `FAKE_PREFILL_MS` (0)  — pause before the first chunk (prefill).
 //! - `FAKE_DIE_MID_STREAM=1`— exit(4) after 2 chunks.
-//! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..}` on start.
+//! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..,"pid":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
 //! - `FAKE_LIST_DEVICES_LOG` — append a line to this file on every `--list-devices`.
 //! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
@@ -100,7 +100,7 @@ async fn main() {
         .unwrap_or(1)
         .max(1);
     if let Ok(p) = std::env::var("FAKE_MODEL_JSON") {
-        let j = serde_json::json!({"alias": &alias, "model": model, "port": port});
+        let j = serde_json::json!({"alias": &alias, "model": model, "port": port, "pid": std::process::id()});
         std::fs::write(p, j.to_string()).ok();
     }
     let app = App {

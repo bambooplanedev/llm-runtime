@@ -257,6 +257,72 @@ async fn cuda_probe_runs_only_after_cheap_checks() {
     r.shutdown().await;
 }
 
+/// spec 2.6: pinned-модель, чию дитину вбито ззовні, повертається сама.
+#[tokio::test]
+async fn pinned_child_killed_externally_comes_back() {
+    let j = tempfile::NamedTempFile::new().unwrap();
+    let mut c = cfg();
+    c.pin = vec!["a".into()];
+    c.child_ports = (7617, 7618);
+    c.llama_server = format!("env FAKE_MODEL_JSON={} {}", j.path().display(), fake());
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    wait_loaded(&r, "a").await;
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(j.path()).unwrap()).unwrap();
+    let pid = v["pid"].as_u64().unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    // Спершу дочекатися, що смерть помічено: інакше wait_loaded побачив би старий Loaded.
+    for _ in 0..100 {
+        if r.snapshot().0[0].state != ModelState::Loaded {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_ne!(
+        r.snapshot().0[0].state,
+        ModelState::Loaded,
+        "death must be noticed"
+    );
+    wait_loaded(&r, "a").await; // cooldown 1 s + завантаження
+    bg.abort();
+    r.shutdown().await;
+}
+
+/// spec 2.6: pin, що не влазить, не пробується кожен такт — backoff FAILED_COOLDOWN.
+#[tokio::test]
+async fn pinned_that_does_not_fit_backs_off() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut c = cfg();
+    c.pin = vec!["a".into()];
+    c.child_ports = (7619, 7619);
+    // Власний облік пропускає (10 000), CUDA-проба каже 500 вільних → NoMemory; кожна спроба = рядок.
+    c.llama_server = format!(
+        "env FAKE_MEM_MB=500 FAKE_LIST_DEVICES_LOG={} {}",
+        log.path().display(),
+        fake()
+    );
+    let cuda = Hw {
+        cpu: "x".into(),
+        device: "CUDA0".into(),
+        mem_limit_mb: 10_000,
+    };
+    let r = Runner::new(&c, cuda, vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    // Спроби: t≈0 (перший такт) і t≈1.0–1.2 s (cooldown 1 s під fast tick, такт 200 ms);
+    // третя — не раніше 2.0 s. Без повторів було б 1, без backoff — ~8.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let attempts = std::fs::read_to_string(log.path()).unwrap().lines().count();
+    assert_eq!(
+        attempts, 2,
+        "one retry per cooldown, not per tick and not never"
+    );
+    bg.abort();
+}
+
 #[test]
 fn idle_stop_decision() {
     let now = Instant::now();

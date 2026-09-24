@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         http,
     };
 
-    tokio::spawn(runner.clone().run_background()); // pinned стартують тут, до announce (§3)
+    tokio::spawn(runner.clone().run_background()); // нагляд за дітьми; pinned стартують на першому такті циклу (spec 2.6)
     tokio::spawn(disc.run());
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port)).await?;
     tracing::info!("gateway on :{}", cfg.port);
