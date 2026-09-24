@@ -133,4 +133,5 @@ and model that executed it.
 | `502 upstream failed` | `llama-server` crashed while answering; see the daemon log |
 | A model disappears from `/v1/models` for about a minute | It failed to load and is cooling down before the next attempt |
 | A new GGUF does not show up | Wait two rescans (~60 s); a file still being copied is not announced |
-| A request hangs ~25 s, then fails over | The executing node dropped off the network; it is retried elsewhere |
+| A request hangs ~25 s before the first token, then goes to another node | The chosen node dropped off the network before answering; the request is retried elsewhere |
+| A stream hangs ~25 s and then errors out mid-answer | The executing node dropped off the network after tokens had already started; the client sees `upstream_lost` and must retry itself |
