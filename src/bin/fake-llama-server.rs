@@ -12,6 +12,7 @@
 //! - `FAKE_DIE_MID_STREAM=1`— exit(4) after 2 chunks.
 //! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
+//! - `FAKE_LIST_DEVICES_LOG` — append a line to this file on every `--list-devices`.
 
 use axum::{
     extract::State,
@@ -52,6 +53,17 @@ fn arg(args: &[String], key: &str) -> Option<String> {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list-devices") {
+        // Тести рахують виклики проби: кожен виклик — рядок у файлі.
+        if let Ok(p) = std::env::var("FAKE_LIST_DEVICES_LOG") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let _ = writeln!(f, "list-devices");
+            }
+        }
         let mem = std::env::var("FAKE_MEM_MB").unwrap_or_else(|_| "16384".into());
         println!(
             "Available devices:\n  MTL0: Fake M4 ({mem} MiB, {mem} MiB free)\n  BLAS: Accelerate (0 MiB, 0 MiB free)"

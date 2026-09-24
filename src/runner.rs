@@ -15,6 +15,27 @@ struct Slot {
     model: LocalModel,
     proc_: Option<Proc>,
     last_used: Instant,
+    /// Коли модель стала `Failed`; фоновий цикл повертає її в `Available` після cooldown.
+    failed_at: Option<Instant>,
+}
+
+impl Slot {
+    fn new(model: LocalModel) -> Slot {
+        Slot {
+            model,
+            proc_: None,
+            last_used: Instant::now(),
+            failed_at: None,
+        }
+    }
+}
+
+/// Повтор завантаження моделі, що впала, — не частіше (spec 2.2). Раз на хвилину — не цикл OOM.
+pub const FAILED_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Тести прискорюють такти через `LLMRT_FAST_TICK`.
+fn fast_tick() -> bool {
+    std::env::var_os("LLMRT_FAST_TICK").is_some()
 }
 
 struct Inner {
@@ -28,16 +49,22 @@ struct Inner {
     node_id: String,
     device: String,
     cfg: Config,
+    failed_cooldown: Duration,
 }
 
 #[derive(Clone)]
 pub struct Runner(Arc<Mutex<Inner>>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadOutcome {
     Accepted,
     AlreadyLoadedOrLoading,
     NoMemory,
     Unknown,
+    /// Модель нещодавно впала; повтор — після `FAILED_COOLDOWN` (spec 2.2).
+    CoolingDown,
+    /// Не вдалося запустити процес (порти, fork) — біда вузла, модель лишається `Available`.
+    SpawnFailed,
 }
 
 pub enum ExecTarget {
@@ -160,7 +187,28 @@ impl Inner {
             }
             s.model.entry.state = next;
             s.model.entry.inflight = 0;
+            s.failed_at = (next == ModelState::Failed).then(Instant::now);
         }
+    }
+
+    /// Перевірки без I/O. `Ok(())` — можна вантажити (spec 1.2: до CUDA-проби і ще раз після).
+    fn precheck(&self, id: &str) -> Result<(), LoadOutcome> {
+        let Some(s) = self.slots.get(id) else {
+            return Err(LoadOutcome::Unknown);
+        };
+        match s.model.entry.state {
+            ModelState::Loading | ModelState::Loaded => {
+                return Err(LoadOutcome::AlreadyLoadedOrLoading)
+            }
+            // Зупиняється просто зараз; наступне опитування побачить Available.
+            ModelState::Draining => return Err(LoadOutcome::NoMemory),
+            ModelState::Failed => return Err(LoadOutcome::CoolingDown),
+            ModelState::Available => {}
+        }
+        if s.model.entry.need_mb > self.free_mb() {
+            return Err(LoadOutcome::NoMemory);
+        }
+        Ok(())
     }
 }
 
@@ -169,16 +217,7 @@ impl Runner {
         let os_reserve_mb = cfg.os_reserve_mb.unwrap_or_else(|| default_os_reserve(&hw));
         let slots = models
             .into_iter()
-            .map(|m| {
-                (
-                    m.entry.id.clone(),
-                    Slot {
-                        model: m,
-                        proc_: None,
-                        last_used: Instant::now(),
-                    },
-                )
-            })
+            .map(|m| (m.entry.id.clone(), Slot::new(m)))
             .collect();
         Runner(Arc::new(Mutex::new(Inner {
             slots,
@@ -191,6 +230,11 @@ impl Runner {
             node_id,
             device: hw.device,
             cfg: cfg.clone(),
+            failed_cooldown: if fast_tick() {
+                Duration::from_secs(1)
+            } else {
+                FAILED_COOLDOWN
+            },
         })))
     }
 
@@ -201,17 +245,18 @@ impl Runner {
         (v, g.free_mb())
     }
 
-    /// Async because the CUDA probe forks a process: on a tokio worker that would block every
-    /// other task on the thread. `spawn` itself stays synchronous — it is sub-millisecond, and
-    /// the child must be forked from a long-lived worker thread (see PDEATHSIG note in `spawn`).
+    /// Async, бо CUDA-проба форкає процес. Дешеві перевірки — до неї (spec 1.2): проба може
+    /// тривати секунди, і для моделі, що однаково не влізе, вона марна. `spawn` лишається
+    /// синхронним і на воркері (див. PDEATHSIG у `spawn`).
     pub async fn load(&self, id: &str) -> LoadOutcome {
-        // §4: on CUDA the reported free memory accounts for foreign processes; on Metal it is
-        // meaningless. The probe runs outside the lock — holding it here would stall every
-        // snapshot() and exec_target() behind a process spawn.
         let probe_cfg = {
             let g = self.0.lock().unwrap();
+            if let Err(o) = g.precheck(id) {
+                return o;
+            }
             g.device.starts_with("CUDA").then(|| g.cfg.clone())
         };
+        // §4: на CUDA reported free враховує чужі процеси; на Metal воно безглузде.
         let reported = match probe_cfg {
             Some(cfg) => tokio::task::spawn_blocking(move || crate::inventory::probe_free_mb(&cfg))
                 .await
@@ -221,29 +266,21 @@ impl Runner {
         };
 
         let mut g = self.0.lock().unwrap();
-        let Some(s) = g.slots.get(id) else {
-            return LoadOutcome::Unknown;
-        };
-        match s.model.entry.state {
-            ModelState::Loading | ModelState::Loaded => return LoadOutcome::AlreadyLoadedOrLoading,
-            // Stopping right now; the next poll will see it available.
-            ModelState::Draining => return LoadOutcome::NoMemory,
-            ModelState::Available | ModelState::Failed => {}
+        // Поки йшла проба, інший запит міг почати завантаження або зайняти пам'ять.
+        if let Err(o) = g.precheck(id) {
+            return o;
         }
-        let need_mb = s.model.entry.need_mb;
-        let mut free = g.free_mb();
         if let Some(reported) = reported {
-            free = free.min(reported.saturating_sub(g.os_reserve_mb));
-        }
-        if need_mb > free {
-            return LoadOutcome::NoMemory;
+            let free = g.free_mb().min(reported.saturating_sub(g.os_reserve_mb));
+            if g.slots[id].model.entry.need_mb > free {
+                return LoadOutcome::NoMemory;
+            }
         }
         match g.spawn(id) {
             Ok(()) => LoadOutcome::Accepted,
             Err(e) => {
                 tracing::error!("spawn {id}: {e:#}");
-                g.slots.get_mut(id).unwrap().model.entry.state = ModelState::Failed;
-                LoadOutcome::NoMemory
+                LoadOutcome::SpawnFailed
             }
         }
     }
@@ -272,11 +309,7 @@ impl Runner {
 
     /// Health + idle, once every 5 s (§6); tests tick faster via `LLMRT_FAST_TICK`.
     pub async fn run_background(self) {
-        let tick = Duration::from_millis(if std::env::var_os("LLMRT_FAST_TICK").is_some() {
-            200
-        } else {
-            5000
-        });
+        let tick = Duration::from_millis(if fast_tick() { 200 } else { 5000 });
         let pins: Vec<String> = self.0.lock().unwrap().pin.clone();
         for p in pins {
             if let LoadOutcome::Accepted = self.load(&p).await {
@@ -288,6 +321,20 @@ impl Runner {
             .build()
             .unwrap();
         loop {
+            // Окремий прохід по ВСІХ слотах: цикл нижче бачить лише слоти з процесом (spec 2.2).
+            {
+                let mut g = self.0.lock().unwrap();
+                let cooldown = g.failed_cooldown;
+                for s in g.slots.values_mut() {
+                    if s.model.entry.state == ModelState::Failed
+                        && s.failed_at.is_some_and(|t| t.elapsed() >= cooldown)
+                    {
+                        s.model.entry.state = ModelState::Available;
+                        s.failed_at = None;
+                        tracing::info!("{}: cooldown over, available again", s.model.entry.id);
+                    }
+                }
+            }
             let running: Vec<(String, u16, ModelState)> = self
                 .0
                 .lock()

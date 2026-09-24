@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 /// Таймаут службових запитів до сусіда (§3).
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
+/// `/load` на CUDA спершу запускає `--list-devices` — 2 s `PEER_TIMEOUT` замало (spec 1.2).
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Генерація може тривати довго; це запобіжник, а не бюджет (§5).
 const EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Максимум два повтори `pick` (§5).
@@ -91,6 +93,10 @@ async fn load(State(gw): State<Gateway>, Json(r): Json<LoadReq>) -> Response {
             StatusCode::ACCEPTED.into_response()
         }
         LoadOutcome::NoMemory => (StatusCode::CONFLICT, Json(local_state(&gw))).into_response(),
+        // Модель у cooldown або вузол не зміг запустити процес: викликач виключить пару.
+        LoadOutcome::CoolingDown | LoadOutcome::SpawnFailed => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(local_state(&gw))).into_response()
+        }
         LoadOutcome::Unknown => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -431,7 +437,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             let r = gw
                 .http
                 .post(format!("http://{}/load", pick.addr))
-                .timeout(PEER_TIMEOUT)
+                .timeout(LOAD_TIMEOUT)
                 .json(&serde_json::json!({"model": pick.pair.model_id}))
                 .send()
                 .await;

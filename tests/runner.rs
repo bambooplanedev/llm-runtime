@@ -153,6 +153,16 @@ async fn no_memory_and_failed_load() {
     }
     assert_eq!(r.snapshot().0[0].state, ModelState::Failed);
     assert_eq!(r.snapshot().1, 10_000, "failed holds no memory");
+    // Застарілий знімок чи pin не обходять cooldown (spec 2.2)…
+    assert!(matches!(r.load("c").await, LoadOutcome::CoolingDown));
+    // …а після нього (1 s під LLMRT_FAST_TICK) модель знову Available.
+    for _ in 0..60 {
+        if r.snapshot().0[0].state == ModelState::Available {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(r.snapshot().0[0].state, ModelState::Available);
     bg.abort();
     r.shutdown().await;
 }
@@ -203,5 +213,46 @@ async fn pinned_start_on_boot_and_inflight_blocks_idle() {
     );
     drop(guard);
     bg.abort();
+    r.shutdown().await;
+}
+
+/// Порти скінчились — біда вузла, а не моделі: модель лишається Available і видимою (spec 2.2).
+#[tokio::test]
+async fn spawn_failure_keeps_model_available() {
+    let mut c = cfg();
+    c.child_ports = (7614, 7614);
+    let _busy = std::net::TcpListener::bind(("127.0.0.1", 7614)).unwrap();
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    assert!(matches!(r.load("a").await, LoadOutcome::SpawnFailed));
+    assert_eq!(r.snapshot().0[0].state, ModelState::Available);
+    assert_eq!(r.snapshot().1, 10_000);
+}
+
+/// CUDA-проба форкає процес — лише після дешевих перевірок (spec 1.2).
+#[tokio::test]
+async fn cuda_probe_runs_only_after_cheap_checks() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let mut c = cfg();
+    c.child_ports = (7615, 7616);
+    c.llama_server = format!(
+        "env FAKE_LIST_DEVICES_LOG={} {}",
+        log.path().display(),
+        fake()
+    );
+    let cuda = Hw {
+        cpu: "x".into(),
+        device: "CUDA0".into(),
+        mem_limit_mb: 1500,
+    };
+    let r = Runner::new(&c, cuda, vec![lm("big", 5000), lm("a", 1000)], "n1".into());
+    let probes = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    assert!(matches!(r.load("big").await, LoadOutcome::NoMemory));
+    assert_eq!(probes(), 0, "a model that cannot fit is never probed");
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    assert_eq!(
+        probes(),
+        1,
+        "positive control: a fitting model is probed once"
+    );
     r.shutdown().await;
 }
