@@ -741,3 +741,20 @@ fn new_gguf_appears_without_restart() {
         t.elapsed()
     );
 }
+
+/// spec 3.1: CLI на clap — `--version`/`--help` виходять з кодом 0, `--help` згадує `--config`.
+#[test]
+fn cli_help_and_version_exit_zero() {
+    let out = Command::new(env!("CARGO_BIN_EXE_llmrt"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_PKG_VERSION")));
+    let out = Command::new(env!("CARGO_BIN_EXE_llmrt"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--config"));
+}

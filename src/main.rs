@@ -1,6 +1,7 @@
-//! Демон `llmrt [шлях/до/llmrt.toml]`: конфіг → node_id → probe → сироти →
+//! Демон `llmrt [PATH | --config PATH]`: конфіг → node_id → probe → сироти →
 //! скан моделей → runner → discovery → лог → gateway (§1–§7).
 
+use clap::Parser;
 use llmrt::{
     config::Config,
     discovery::Discovery,
@@ -9,7 +10,20 @@ use llmrt::{
     reqlog::ReqLog,
     runner::Runner,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Turn several machines on one LAN into a single OpenAI-compatible inference endpoint.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Path to llmrt.toml; every field has a default when omitted
+    #[arg(value_name = "PATH", conflicts_with = "config")]
+    path: Option<PathBuf>,
+    /// Path to llmrt.toml (same as the positional PATH)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
 
 /// Скільки чекати на з'єднання, що ще в польоті, після сигналу. Довга генерація
 /// має власний таймаут у годину (`EXEC_TIMEOUT`), тож без цієї межі SIGTERM
@@ -38,13 +52,14 @@ async fn stop_signal() {
 // (`/load`, `/exec`) прямо з обробника — на current_thread це був би дедлок.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llmrt=info")),
         )
         .init();
-    let path = std::env::args().nth(1).map(std::path::PathBuf::from);
+    let path = cli.config.or(cli.path);
     let cfg = Arc::new(Config::load(path.as_deref())?);
     std::fs::create_dir_all(&cfg.data_dir)?;
 
