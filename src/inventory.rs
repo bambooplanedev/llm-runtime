@@ -46,9 +46,15 @@ pub fn model_id(file_name: &str) -> String {
 }
 
 /// -c у llama.cpp — загальний контекст на всі слоти (checks.md #5), тому np не множиться.
+/// У гібридах (qwen35/qwen3next) KV є лише в кожному `full_attention_interval`-му шарі;
+/// стан рекурентних шарів фіксований і малий, його покриває запас 512 MB.
 pub fn kv_mb(meta: &GgufMeta, a: &LlamaArgs) -> u64 {
+    let kv_layers = match meta.full_attention_interval {
+        Some(n) if n > 0 => meta.layers / n,
+        _ => meta.layers,
+    };
     let bytes = 2.0
-        * meta.layers as f64
+        * kv_layers as f64
         * meta.kv_heads as f64
         * meta.head_dim as f64
         * a.ctx as f64
@@ -378,6 +384,26 @@ mod tests {
     fn model_id_strips_extension_and_shard_suffix() {
         assert_eq!(model_id("Qwen3-8B-Q4_K_M.gguf"), "qwen3-8b-q4_k_m");
         assert_eq!(model_id("Big-70B-Q4-00001-of-00003.gguf"), "big-70b-q4");
+    }
+
+    /// Qwen3.5-9B: 32 шари, KV лише в кожному 4-му → 8 шарів. Рахувати всі 32 — у 4 рази більше,
+    /// і на 8 GB VRAM модель, що влазить, отримувала 503.
+    #[test]
+    fn kv_counts_only_full_attention_layers_in_hybrids() {
+        let meta = crate::gguf::GgufMeta {
+            layers: 32,
+            kv_heads: 4,
+            head_dim: 256,
+            full_attention_interval: Some(4),
+            ..Default::default()
+        };
+        let a = LlamaArgs {
+            ctx: 4096,
+            np: 1,
+            kv_bytes_per_elem: 2.0,
+        };
+        // 2 * 8 * 4 * 256 * 4096 * 2 байти = 128 MB
+        assert_eq!(kv_mb(&meta, &a), 128);
     }
 
     #[test]

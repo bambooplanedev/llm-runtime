@@ -2,6 +2,7 @@
 """Мінімальний GGUF v3 із заголовком і tensor-info, без даних тензорів.
 Використання: make_gguf.py out.gguf --arch qwen3 --layers 28 --kv-heads 8 --head-dim 128
              [--params-per-layer N] [--experts 128 --experts-used 8] [--split 1/3] [--no-tensors]
+             [--full-attention-interval 4]
 `--head-dim 0` пропускає attention.key_length → парсер мусить упасти на
 embedding_length / attention.head_count.
 `--split K/N` при K>1 пише лише split.* і тензори, як llama-gguf-split.
@@ -22,6 +23,7 @@ ap.add_argument("--embedding-length", type=int, default=4096)
 ap.add_argument("--head-count", type=int, default=32)
 ap.add_argument("--params-per-layer", type=int, default=1_000_000)
 ap.add_argument("--experts", type=int); ap.add_argument("--experts-used", type=int)
+ap.add_argument("--full-attention-interval", type=int)  # гібрид як qwen35: KV лише в кожному N-му шарі
 ap.add_argument("--split")  # "1/3"
 ap.add_argument("--no-tensors", action="store_true")  # перший шард у режимі --no-tensor-first-split
 ap.add_argument("--pad-mb", type=int, default=0)
@@ -46,6 +48,8 @@ if not split_no:
                 kv_u32(f"{a.arch}.attention.head_count", a.head_count)]
     if a.experts:
         kvs += [kv_u32(f"{a.arch}.expert_count", a.experts), kv_u32(f"{a.arch}.expert_used_count", a.experts_used)]
+    if a.full_attention_interval:
+        kvs += [kv_u32(f"{a.arch}.full_attention_interval", a.full_attention_interval)]
 if a.split:
     kvs += [kv_u16("split.no", split_no), kv_u16("split.count", cnt),
             kv_i32("split.tensors.count", a.layers * cnt)]

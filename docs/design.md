@@ -100,8 +100,11 @@ One JSON document per node at `GET /state`:
   IPv6 link-local is ignored in step 1.
 - **`proto`** is an integer compared for equality. Semver `version` is for humans only.
 - **`need_mb`** = `size_mb + kv_mb + 512`. `kv_mb` is derived from GGUF metadata and `llama_args`:
-  `2 × layers × kv_heads × head_dim × ctx × bytes_per_elem`, bytes from `-ctk`/`-ctv`. `-c` is the
-  total context across all slots, so there is no `np` multiplier. 512 MB is the compute buffer,
+  `2 × kv_layers × kv_heads × head_dim × ctx × bytes_per_elem`, bytes from `-ctk`/`-ctv`. `-c` is the
+  total context across all slots, so there is no `np` multiplier. `kv_layers` is `block_count`,
+  except in hybrids that set `<arch>.full_attention_interval` (qwen35, qwen3next): only every N-th
+  layer has a KV cache, so `kv_layers = block_count / N`. The fixed-size recurrent state of the
+  other layers fits in the 512 MB. 512 MB is the compute buffer,
   the only named constant. After a child starts, runner reads `/props` and logs any mismatch
   between `n_ctx × total_slots` and `-c`. That is the formula's test on real models.
 - **`free_mb`** = `mem_limit_mb − os_reserve_mb − Σ need_mb` of loaded and loading models. On

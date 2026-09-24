@@ -11,6 +11,7 @@ pub struct GgufMeta {
     pub params: u64,
     pub expert_count: Option<u64>,
     pub expert_used: Option<u64>,
+    pub full_attention_interval: Option<u64>,
     pub split_no: Option<u16>,
     pub split_count: Option<u16>,
     pub file_size: u64,
@@ -153,6 +154,7 @@ pub fn read_meta(path: &Path) -> Result<GgufMeta> {
         .unwrap_or(0);
     m.expert_count = num("expert_count");
     m.expert_used = num("expert_used_count");
+    m.full_attention_interval = num("full_attention_interval");
     m.split_no = num("split.no").map(|v| v as u16);
     m.split_count = num("split.count").map(|v| v as u16);
     for _ in 0..n_tensors {
@@ -211,6 +213,23 @@ mod tests {
         assert_eq!(m.params, 4 * 1000 * 1000); // 1000 x 1000 x 4 тензори
         assert_eq!(m.split_count, None);
         assert_eq!(m.expert_used, None);
+    }
+
+    /// Гібрид (qwen35/qwen3next): KV-кеш лише в кожному N-му шарі.
+    #[test]
+    fn reads_full_attention_interval() {
+        let f = fixture(&[
+            "--arch",
+            "qwen35",
+            "--layers",
+            "32",
+            "--full-attention-interval",
+            "4",
+        ]);
+        let m = read_meta(f.path()).unwrap();
+        assert_eq!(m.full_attention_interval, Some(4));
+        let plain = read_meta(fixture(&["--layers", "4"]).path()).unwrap();
+        assert_eq!(plain.full_attention_interval, None);
     }
 
     #[test]
