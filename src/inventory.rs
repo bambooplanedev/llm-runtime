@@ -74,6 +74,18 @@ pub fn scan(dir: &Path, a: &LlamaArgs) -> Vec<LocalModel> {
                 tracing::warn!("{id}: {} of {expect} shards present, skipped", parts.len());
                 return None;
             }
+            // read_meta пропускає шарди без метаданих, тож групу перевіряємо тут: нумерація
+            // 0..N без дірок і метадані в першому. Інакше kv_mb = 0 і need_mb занижений.
+            let numbered = parts
+                .iter()
+                .enumerate()
+                .all(|(i, (_, m))| m.split_count.is_none() || m.split_no == Some(i as u16));
+            if !numbered || first_meta.layers == 0 {
+                tracing::warn!(
+                    "{id}: shard numbering broken or first shard has no metadata, skipped"
+                );
+                return None;
+            }
             let total: u64 = parts.iter().map(|(_, m)| m.file_size).sum();
             // tensor-info шардів не перетинається, тож параметри, як і розмір, сумуються:
             // взяти лише перший шард — це ~1/N параметрів і, як наслідок, чужий тир (§4).
@@ -315,6 +327,32 @@ mod tests {
             "Mixed-1B-00001-of-00002.gguf",
             &["--layers", "2", "--split", "1/2"],
         );
+        // Обидва файли — «другий шард»: група без метаданих мусить бути пропущена,
+        // інакше kv_mb = 0 і need_mb занижений (spec 2.1).
+        mk(
+            "Bad-1B-00001-of-00002.gguf",
+            &["--layers", "2", "--split", "2/2"],
+        );
+        mk(
+            "Bad-1B-00002-of-00002.gguf",
+            &["--layers", "2", "--split", "2/2"],
+        );
+        // --no-tensor-first-split: перший шард без тензорів, параметри — з другого
+        mk(
+            "Nt-1B-00001-of-00002.gguf",
+            &["--layers", "2", "--split", "1/2", "--no-tensors"],
+        );
+        mk(
+            "Nt-1B-00002-of-00002.gguf",
+            &[
+                "--layers",
+                "2",
+                "--split",
+                "2/2",
+                "--params-per-layer",
+                "1000000",
+            ],
+        );
         std::fs::write(dir.path().join("broken.gguf"), b"nope").unwrap();
         std::fs::write(dir.path().join("readme.txt"), b"x").unwrap();
         let a = LlamaArgs {
@@ -324,14 +362,31 @@ mod tests {
         };
         let mut got = scan(dir.path(), &a);
         got.sort_by(|x, y| x.entry.id.cmp(&y.entry.id));
-        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got.len(),
+            3,
+            "{:?}",
+            got.iter().map(|m| &m.entry.id).collect::<Vec<_>>()
+        );
         assert!(
             !got.iter().any(|m| m.entry.id == "mixed-1b"),
             "змішана група мусить бути пропущена"
         );
-        assert_eq!(got[0].entry.id, "big-3b");
         assert!(
-            got[0].path.ends_with("Big-3B-00001-of-00002.gguf"),
+            !got.iter().any(|m| m.entry.id == "bad-1b"),
+            "група без першого шарду мусить бути пропущена"
+        );
+        let big = got.iter().find(|m| m.entry.id == "big-3b").unwrap();
+        let nt = got.iter().find(|m| m.entry.id == "nt-1b").unwrap();
+        let solo = got.iter().find(|m| m.entry.id == "solo-1b").unwrap();
+        assert!(
+            (nt.entry.params_b - 0.002).abs() < 1e-12,
+            "got {}",
+            nt.entry.params_b
+        );
+        assert!(nt.meta.layers > 0, "метадані — з першого шарду");
+        assert!(
+            big.path.ends_with("Big-3B-00001-of-00002.gguf"),
             "file = перший шард"
         );
         let sz = |n: &str| std::fs::metadata(dir.path().join(n)).unwrap().len();
@@ -342,17 +397,16 @@ mod tests {
             "фікстури мусять давати 5 MiB разом"
         );
         assert_eq!(
-            got[0].entry.need_mb,
-            total / (1024 * 1024) + kv_mb(&got[0].meta, &a) + 512
+            big.entry.need_mb,
+            total / (1024 * 1024) + kv_mb(&big.meta, &a) + 512
         );
         // 2×1e6 + 2×3e6 параметрів у двох шардах: лише перший дав би 0.002 і чужий тир
         assert!(
-            (got[0].entry.params_b - 0.008).abs() < 1e-12,
+            (big.entry.params_b - 0.008).abs() < 1e-12,
             "params_b мусить сумувати шарди, got {}",
-            got[0].entry.params_b
+            big.entry.params_b
         );
-        assert_eq!(got[1].entry.id, "solo-1b");
-        assert_eq!(got[1].entry.state, ModelState::Available);
+        assert_eq!(solo.entry.state, ModelState::Available);
     }
 
     #[test]
