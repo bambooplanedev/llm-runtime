@@ -31,6 +31,7 @@ fn lm(id: &str, need: u64) -> LocalModel {
             slots: 1,
             inflight: 0,
         },
+        fingerprint: vec![(format!("/tmp/{id}.gguf").into(), 1, std::time::UNIX_EPOCH)],
         path: format!("/tmp/{id}.gguf").into(),
         meta: GgufMeta {
             layers: 2,

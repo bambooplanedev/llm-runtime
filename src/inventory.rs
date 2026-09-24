@@ -1,12 +1,31 @@
 use crate::config::{Config, LlamaArgs};
 use crate::gguf::{read_meta, GgufMeta};
 use crate::state::{Hw, ModelEntry, ModelState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// `(шлях, розмір, mtime)` кожного шарду моделі: за ним перескан бачить зміну файлу (spec 2.7).
+pub type Fingerprint = Vec<(PathBuf, u64, SystemTime)>;
+
+/// Попередній скан по файлах: `(розмір, mtime)` і заголовок або текст помилки.
+/// Він же кеш метаданих і база стабілізації (spec 2.7). Кожен скан будує нову мапу.
+pub type ScanCache = HashMap<PathBuf, ((u64, SystemTime), Result<GgufMeta, String>)>;
+
+#[derive(Default)]
+pub struct ScanOut {
+    pub models: Vec<LocalModel>,
+    /// Id, яких злиття не має чіпати: файл ще змінюється, не читається або група неповна.
+    pub keep: HashSet<String>,
+    /// `(ключ для warn-once, текст)`.
+    pub warnings: Vec<(String, String)>,
+    pub cache: ScanCache,
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalModel {
     pub entry: ModelEntry,
+    pub fingerprint: Fingerprint,
     pub path: PathBuf,
     pub meta: GgufMeta,
 }
@@ -42,13 +61,30 @@ pub fn need_mb(meta: &GgufMeta, total_size: u64, a: &LlamaArgs) -> u64 {
     total_size / (1024 * 1024) + kv_mb(meta, a) + 512
 }
 
+/// Стартовий скан: без попереднього, усі попередження — в лог.
 pub fn scan(dir: &Path, a: &LlamaArgs) -> Vec<LocalModel> {
-    let mut groups: BTreeMap<String, Vec<(PathBuf, GgufMeta)>> = BTreeMap::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        tracing::warn!("models_dir {} not readable", dir.display());
-        return vec![];
-    };
-    for e in rd.flatten() {
+    match scan_dir(dir, a, None) {
+        Ok(out) => {
+            for (_, w) in &out.warnings {
+                tracing::warn!("{w}");
+            }
+            out.models
+        }
+        Err(e) => {
+            tracing::warn!("models_dir {} not readable: {e}", dir.display());
+            vec![]
+        }
+    }
+}
+
+type Part = (PathBuf, GgufMeta, u64, SystemTime);
+
+/// spec 2.7. Помилка `read_dir` — `Err`: викликач лишає інвентар як є.
+pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io::Result<ScanOut> {
+    let mut out = ScanOut::default();
+    let mut groups: BTreeMap<String, Vec<Part>> = BTreeMap::new();
+    let mut unstable: HashSet<String> = HashSet::new();
+    for e in std::fs::read_dir(dir)?.flatten() {
         let p = e.path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -56,65 +92,96 @@ pub fn scan(dir: &Path, a: &LlamaArgs) -> Vec<LocalModel> {
         if !name.ends_with(".gguf") {
             continue;
         }
-        match read_meta(&p) {
-            Ok(m) => groups.entry(model_id(name)).or_default().push((p, m)),
-            Err(err) => tracing::warn!("skip {}: {err:#}", p.display()),
+        let id = model_id(name);
+        let Ok(md) = std::fs::metadata(&p) else {
+            continue;
+        };
+        let stamp = (md.len(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        let cached = prev.and_then(|c| c.get(&p)).filter(|(s, _)| *s == stamp);
+        // Без попереднього скану (старт) стабільне все; інакше — лише те, що не змінилось.
+        if prev.is_some() && cached.is_none() {
+            unstable.insert(id.clone());
+        }
+        let meta = match cached {
+            Some((_, m)) => m.clone(),
+            None => read_meta(&p).map_err(|e| format!("{e:#}")),
+        };
+        out.cache.insert(p.clone(), (stamp, meta.clone()));
+        match meta {
+            Ok(m) => groups.entry(id).or_default().push((p, m, stamp.0, stamp.1)),
+            Err(err) => {
+                out.warnings.push((
+                    format!("skip:{}:{stamp:?}", p.display()),
+                    format!("skip {}: {err}", p.display()),
+                ));
+                out.keep.insert(id);
+            }
         }
     }
-    groups
-        .into_iter()
-        .filter_map(|(id, mut parts)| {
-            parts.sort_by_key(|x| x.1.split_no);
-            let (first_path, first_meta) = parts[0].clone();
-            // Без split.count файл мусить бути один: `None < Some(0)`, тож нешардований файл
-            // сортується першим і група «нешардований + шард» інакше пройшла б без перевірки
-            // і подвоїла б розмір.
-            let expect = first_meta.split_count.map_or(1, |c| c as usize);
-            if parts.len() != expect {
-                tracing::warn!("{id}: {} of {expect} shards present, skipped", parts.len());
-                return None;
-            }
-            // read_meta пропускає шарди без метаданих, тож групу перевіряємо тут: нумерація
-            // 0..N без дірок і метадані в першому. Інакше kv_mb = 0 і need_mb занижений.
-            let numbered = parts
-                .iter()
-                .enumerate()
-                .all(|(i, (_, m))| m.split_count.is_none() || m.split_no == Some(i as u16));
-            if !numbered || first_meta.layers == 0 {
-                tracing::warn!(
-                    "{id}: shard numbering broken or first shard has no metadata, skipped"
-                );
-                return None;
-            }
-            let total: u64 = parts.iter().map(|(_, m)| m.file_size).sum();
-            // tensor-info шардів не перетинається, тож параметри, як і розмір, сумуються:
-            // взяти лише перший шард — це ~1/N параметрів і, як наслідок, чужий тир (§4).
-            let params: u64 = parts.iter().map(|(_, m)| m.params).sum();
-            let params_b = params as f64 / 1e9;
-            let active = first_meta
-                .expert_used
-                .zip(first_meta.expert_count)
-                .map(|(u, c)| params_b * u as f64 / c as f64);
-            Some(LocalModel {
-                entry: ModelEntry {
-                    id,
-                    file: first_path
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                    params_b,
-                    active_params_b: active,
-                    need_mb: need_mb(&first_meta, total, a),
-                    state: ModelState::Available,
-                    slots: a.np,
-                    inflight: 0,
-                },
-                path: first_path,
-                meta: first_meta,
-            })
-        })
-        .collect()
+    for (id, mut parts) in groups {
+        if unstable.contains(&id) || out.keep.contains(&id) {
+            out.keep.insert(id);
+            continue;
+        }
+        parts.sort_by_key(|x| x.1.split_no);
+        let fp_key = format!(
+            "{id}:{:?}",
+            parts.iter().map(|x| (x.2, x.3)).collect::<Vec<_>>()
+        );
+        // Без split.count файл мусить бути один: `None < Some(0)`, тож нешардований файл
+        // сортується першим і група «нешардований + шард» інакше подвоїла б розмір.
+        let expect = parts[0].1.split_count.map_or(1, |c| c as usize);
+        if parts.len() != expect {
+            out.warnings.push((
+                fp_key,
+                format!("{id}: {} of {expect} shards present, skipped", parts.len()),
+            ));
+            out.keep.insert(id);
+            continue;
+        }
+        // read_meta пропускає шарди без метаданих, тож групу перевіряємо тут (spec 2.1).
+        let numbered = parts
+            .iter()
+            .enumerate()
+            .all(|(i, x)| x.1.split_count.is_none() || x.1.split_no == Some(i as u16));
+        if !numbered || parts[0].1.layers == 0 {
+            out.warnings.push((
+                fp_key,
+                format!("{id}: shard numbering broken or first shard has no metadata, skipped"),
+            ));
+            out.keep.insert(id);
+            continue;
+        }
+        let (first_path, first_meta) = (parts[0].0.clone(), parts[0].1.clone());
+        let total: u64 = parts.iter().map(|x| x.1.file_size).sum();
+        // tensor-info шардів не перетинається, тож параметри, як і розмір, сумуються (§4).
+        let params: u64 = parts.iter().map(|x| x.1.params).sum();
+        let params_b = params as f64 / 1e9;
+        let active = first_meta
+            .expert_used
+            .zip(first_meta.expert_count)
+            .map(|(u, c)| params_b * u as f64 / c as f64);
+        out.models.push(LocalModel {
+            entry: ModelEntry {
+                id,
+                file: first_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                params_b,
+                active_params_b: active,
+                need_mb: need_mb(&first_meta, total, a),
+                state: ModelState::Available,
+                slots: a.np,
+                inflight: 0,
+            },
+            fingerprint: parts.iter().map(|x| (x.0.clone(), x.2, x.3)).collect(),
+            path: first_path,
+            meta: first_meta,
+        });
+    }
+    Ok(out)
 }
 
 const GPU_PREFIXES: [&str; 5] = ["MTL", "CUDA", "Vulkan", "ROCm", "HIP"];
@@ -478,6 +545,70 @@ mod tests {
         let cuda = "Available devices:\n  CUDA0: NVIDIA RTX 3060 (12288 MiB, 9800 MiB free)\n";
         assert_eq!(parse_free_mb(cuda), Some(9800));
         assert_eq!(default_os_reserve(&parse_list_devices(cuda)), 1024);
+    }
+
+    /// spec 2.7: новий чи змінений файл береться лише на другому скані з тим самим
+    /// (size, mtime); непрочитаний лишається в keep; warn-once ключ стабільний.
+    #[test]
+    fn rescan_waits_for_a_stable_file_and_keeps_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str| {
+            let st = std::process::Command::new("python3")
+                .arg("tests/fixtures/make_gguf.py")
+                .arg(dir.path().join(name))
+                .args(["--layers", "2"])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        let a = LlamaArgs {
+            ctx: 1024,
+            np: 1,
+            kv_bytes_per_elem: 2.0,
+        };
+        let ids = |s: &ScanOut| {
+            s.models
+                .iter()
+                .map(|m| m.entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        mk("A-1B.gguf");
+        let s0 = scan_dir(dir.path(), &a, None).unwrap();
+        assert_eq!(ids(&s0), vec!["a-1b"], "start: everything is stable");
+        assert_eq!(s0.models[0].fingerprint.len(), 1);
+
+        mk("B-1B.gguf");
+        std::fs::write(dir.path().join("Broken-1B.gguf"), b"nope").unwrap();
+        let s1 = scan_dir(dir.path(), &a, Some(&s0.cache)).unwrap();
+        assert_eq!(ids(&s1), vec!["a-1b"], "a new file waits one scan");
+        assert!(s1.keep.contains("b-1b") && s1.keep.contains("broken-1b"));
+
+        let s2 = scan_dir(dir.path(), &a, Some(&s1.cache)).unwrap();
+        assert_eq!(ids(&s2), vec!["a-1b", "b-1b"]);
+        assert!(s2.keep.contains("broken-1b"), "unreadable stays in keep");
+        let key = |s: &ScanOut| {
+            s.warnings
+                .iter()
+                .find(|(_, w)| w.contains("Broken-1B"))
+                .unwrap()
+                .0
+                .clone()
+        };
+        assert_eq!(key(&s1), key(&s2), "same file → same warn-once key");
+
+        // A змінився (дописали байти) → знову нестабільний, але в keep, а не «видалений».
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("A-1B.gguf"))
+            .unwrap()
+            .write_all(b"more")
+            .unwrap();
+        let s3 = scan_dir(dir.path(), &a, Some(&s2.cache)).unwrap();
+        assert!(!ids(&s3).contains(&"a-1b".to_string()) && s3.keep.contains("a-1b"));
+
+        assert!(scan_dir(&dir.path().join("missing"), &a, None).is_err());
     }
 
     #[test]
