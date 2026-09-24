@@ -1,7 +1,8 @@
-use crate::config::Config;
-use crate::inventory::{default_os_reserve, LocalModel};
+use crate::config::{Config, LlamaArgs};
+use crate::inventory::{default_os_reserve, LocalModel, ScanCache};
 use crate::state::{Hw, ModelEntry, ModelState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,6 +22,8 @@ struct Slot {
     pin_retry_at: Option<Instant>,
     /// Останній результат pin-спроби — щоб не спамити лог однаковим попередженням щотакту.
     pin_last: Option<&'static str>,
+    /// Чи вже залоговано «changed on disk, running old file»: раз на зміну, не щоперескан.
+    stale_logged: bool,
 }
 
 impl Slot {
@@ -32,9 +35,21 @@ impl Slot {
             failed_at: None,
             pin_retry_at: None,
             pin_last: None,
+            stale_logged: false,
         }
     }
 }
+
+/// Процес є або ще завершується: такий слот перескан не замінює і не видаляє (spec 2.7).
+fn busy(st: ModelState) -> bool {
+    matches!(
+        st,
+        ModelState::Loading | ModelState::Loaded | ModelState::Draining
+    )
+}
+
+/// Перескан теки (spec 2.7); під `LLMRT_FAST_TICK` — раз на секунду.
+pub const RESCAN_EVERY: Duration = Duration::from_secs(30);
 
 /// Повтор завантаження моделі, що впала, — не частіше (spec 2.2). Раз на хвилину — не цикл OOM.
 pub const FAILED_COOLDOWN: Duration = Duration::from_secs(60);
@@ -293,6 +308,93 @@ impl Runner {
         let mut v: Vec<ModelEntry> = g.slots.values().map(|s| s.model.entry.clone()).collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         (v, g.free_mb())
+    }
+
+    /// Злиття перескану (spec 2.7, таблиця). «Після зупинки» робить наступний скан:
+    /// слот уже без процесу, і спрацьовує звичайне правило.
+    pub fn merge_scan(&self, models: Vec<LocalModel>, keep: &HashSet<String>) {
+        let mut g = self.0.lock().unwrap();
+        let mut seen: HashSet<String> = HashSet::new();
+        for m in models {
+            let id = m.entry.id.clone();
+            seen.insert(id.clone());
+            match g.slots.get_mut(&id) {
+                None => {
+                    tracing::info!("{id}: new model in models_dir");
+                    g.slots.insert(id, Slot::new(m));
+                }
+                Some(s) if s.model.fingerprint == m.fingerprint => {}
+                Some(s) if busy(s.model.entry.state) => {
+                    if !s.stale_logged {
+                        tracing::info!("{id}: changed on disk, running old file until it stops");
+                        s.stale_logged = true;
+                    }
+                }
+                Some(s) => {
+                    tracing::info!("{id}: changed on disk, reloaded");
+                    *s = Slot::new(m);
+                }
+            }
+        }
+        g.slots.retain(|id, s| {
+            let stay = seen.contains(id) || keep.contains(id) || busy(s.model.entry.state);
+            if !stay {
+                tracing::info!("{id}: file removed from models_dir");
+            }
+            stay
+        });
+    }
+
+    /// Фонова задача перескану. `initial` — кеш стартового скану: перший перескан порівнює з ним.
+    pub async fn run_rescan(self, dir: PathBuf, args: LlamaArgs, initial: ScanCache) {
+        let every = if fast_tick() {
+            Duration::from_secs(1)
+        } else {
+            RESCAN_EVERY
+        };
+        let mut prev = initial;
+        let mut warned: HashSet<String> = HashSet::new();
+        let mut dir_down = false;
+        loop {
+            tokio::time::sleep(every).await;
+            let (d, p) = (dir.clone(), prev.clone());
+            let res = tokio::task::spawn_blocking(move || {
+                crate::inventory::scan_dir(&d, &args, Some(&p))
+            })
+            .await;
+            let out = match res {
+                Ok(Ok(out)) => {
+                    if dir_down {
+                        tracing::info!("models_dir {} readable again", dir.display());
+                        dir_down = false;
+                    }
+                    out
+                }
+                // Збій NFS/USB: інвентар не стирається (spec 2.7).
+                Ok(Err(e)) => {
+                    if !dir_down {
+                        tracing::warn!(
+                            "models_dir {}: {e}; keeping current inventory",
+                            dir.display()
+                        );
+                        dir_down = true;
+                    }
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            // Warn once: той самий ключ (файл + розмір + mtime) не повторюється кожні 30 s.
+            let mut now_warned = HashSet::new();
+            for (k, w) in out.warnings {
+                if !warned.contains(&k) {
+                    tracing::warn!("{w}");
+                }
+                now_warned.insert(k);
+            }
+            warned = now_warned;
+            self.merge_scan(out.models, &out.keep);
+            prev = out.cache;
+        }
     }
 
     /// Async, бо CUDA-проба форкає процес. Дешеві перевірки — до неї (spec 1.2): проба може

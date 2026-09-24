@@ -70,7 +70,15 @@ async fn main() -> anyhow::Result<()> {
     Runner::kill_orphans(&node_id);
 
     let args = cfg.parse_llama_args();
-    let models = inventory::scan(&cfg.models_dir, &args);
+    // Стартовий скан дає і моделі, і кеш — з ним перескан не перечитує заголовки (spec 2.7).
+    let scanned = inventory::scan_dir(&cfg.models_dir, &args, None).unwrap_or_else(|e| {
+        tracing::warn!("models_dir {} not readable: {e}", cfg.models_dir.display());
+        inventory::ScanOut::default()
+    });
+    for (_, w) in &scanned.warnings {
+        tracing::warn!("{w}");
+    }
+    let models = scanned.models;
     tracing::info!(
         "node {node_id} ({}) device {} limit {} MB, {} models",
         cfg.name,
@@ -98,6 +106,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     tokio::spawn(runner.clone().run_background()); // нагляд за дітьми; pinned стартують на першому такті циклу (spec 2.6)
+    tokio::spawn(
+        runner
+            .clone()
+            .run_rescan(cfg.models_dir.clone(), args, scanned.cache),
+    );
     tokio::spawn(disc.run());
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port)).await?;
     tracing::info!("gateway on :{}", cfg.port);

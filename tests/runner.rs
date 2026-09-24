@@ -3,6 +3,7 @@ use llmrt::gguf::GgufMeta;
 use llmrt::inventory::LocalModel;
 use llmrt::runner::{should_idle_stop, ExecTarget, LoadOutcome, Runner};
 use llmrt::state::{Hw, ModelEntry, ModelState};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 fn fake() -> String {
@@ -369,6 +370,59 @@ async fn shutdown_blocks_new_spawns_even_for_pins() {
     );
     assert_eq!(r.load("a").await, LoadOutcome::ShuttingDown);
     bg.abort();
+}
+
+/// spec 2.7: правила злиття. «Процес є» = Loading/Loaded/Draining — такий слот не чіпаємо.
+#[tokio::test]
+async fn merge_scan_rules() {
+    let mut c = cfg();
+    c.child_ports = (7621, 7622);
+    let r = Runner::new(
+        &c,
+        hw(10_000),
+        vec![
+            lm("run", 1000),
+            lm("gone", 1000),
+            lm("chg", 1000),
+            lm("kept", 1000),
+        ],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("run").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "run").await;
+
+    let changed = |id: &str, need: u64| {
+        let mut m = lm(id, need);
+        m.fingerprint = vec![(format!("/tmp/{id}.gguf").into(), 2, std::time::UNIX_EPOCH)];
+        m
+    };
+    // run змінився на диску, але працює; gone зник; chg змінився; kept у keep; new — новий.
+    r.merge_scan(
+        vec![changed("run", 3000), changed("chg", 2000), lm("new", 500)],
+        &HashSet::from(["kept".to_string()]),
+    );
+    let (models, _) = r.snapshot();
+    let get = |id: &str| models.iter().find(|m| m.id == id);
+    assert_eq!(
+        get("run").unwrap().state,
+        ModelState::Loaded,
+        "running model untouched"
+    );
+    assert_eq!(get("run").unwrap().need_mb, 1000, "old file keeps running");
+    assert!(
+        get("gone").is_none(),
+        "removed file, no process → slot removed"
+    );
+    assert_eq!(
+        get("chg").unwrap().need_mb,
+        2000,
+        "changed file, no process → replaced"
+    );
+    assert!(get("kept").is_some(), "keep protects the slot");
+    assert!(get("new").is_some());
+    bg.abort();
+    r.shutdown().await;
 }
 
 #[test]

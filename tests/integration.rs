@@ -707,3 +707,37 @@ fn llama_cpp_4xx_reaches_the_client_verbatim() {
         "{log}"
     );
 }
+
+/// spec 2.7: новий GGUF з'являється без перезапуску. Файл пишемо поза текою і робимо rename,
+/// інакше скан міг би прочитати напівзаписаний файл.
+#[test]
+fn new_gguf_appears_without_restart() {
+    let _s = serial();
+    let a = spawn(7719, "7776-7779", &[], &[("tiny-0.2b.gguf", 2)]);
+    node_up(a.port, 1);
+    let tmp = tempfile::tempdir().unwrap();
+    gguf(tmp.path(), "late-0.2b.gguf", 2);
+    std::fs::rename(
+        tmp.path().join("late-0.2b.gguf"),
+        a.dir.path().join("models/late-0.2b.gguf"),
+    )
+    .unwrap();
+    let t = Instant::now();
+    wait_for(
+        a.port,
+        |v| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "late-0.2b")
+        },
+        "/v1/models",
+        "late model",
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        t.elapsed()
+    );
+}
