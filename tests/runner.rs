@@ -322,13 +322,29 @@ async fn pinned_that_does_not_fit_backs_off() {
     };
     let r = Runner::new(&c, cuda, vec![lm("a", 1000)], "n1".into());
     let bg = tokio::spawn(r.clone().run_background());
-    // Спроби: t≈0 (перший такт) і t≈1.0–1.2 s (cooldown 1 s під fast tick, такт 200 ms);
-    // третя — не раніше 2.0 s. Без повторів було б 1, без backoff — ~8.
-    tokio::time::sleep(Duration::from_millis(1600)).await;
-    let attempts = std::fs::read_to_string(log.path()).unwrap().lines().count();
-    assert_eq!(
-        attempts, 2,
-        "one retry per cooldown, not per tick and not never"
+    // Спроби: t≈0 (перший такт) і t≈1.0–1.2 s (cooldown 1 s під fast tick, такт 200 ms).
+    // Чекаємо (до 5 s, під навантаженням процес може стартувати пізніше), поки не з'явиться
+    // друга спроба, і звіряємо різницю міток часу — вона доводить, що це cooldown (1 s),
+    // а не такт (200 ms). Не дочекатись двох рядків за 5 s означає "ніколи не повторив".
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let lines = loop {
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        let n = content.lines().count();
+        if n >= 2 {
+            break content;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never retried: expected >= 2 attempts within 5 s, got {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let mut times = lines.lines().take(2).map(|l| l.parse::<u128>().unwrap());
+    let t1 = times.next().unwrap();
+    let t2 = times.next().unwrap();
+    assert!(
+        t2 - t1 >= 900,
+        "retry must wait ~FAILED_COOLDOWN, not a 200 ms tick"
     );
     bg.abort();
 }

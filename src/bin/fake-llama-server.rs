@@ -12,7 +12,7 @@
 //! - `FAKE_DIE_MID_STREAM=1`— exit(4) after 2 chunks.
 //! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..,"pid":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
-//! - `FAKE_LIST_DEVICES_LOG` — append a line to this file on every `--list-devices`.
+//! - `FAKE_LIST_DEVICES_LOG` — append a millisecond timestamp line to this file on every `--list-devices`.
 //! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
 
 use axum::{
@@ -28,7 +28,7 @@ use axum::{
 use futures_util::stream;
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone)]
@@ -63,7 +63,11 @@ async fn main() {
                 .append(true)
                 .open(p)
             {
-                let _ = writeln!(f, "list-devices");
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let _ = writeln!(f, "{ms}");
             }
         }
         let mem = std::env::var("FAKE_MEM_MB").unwrap_or_else(|_| "16384".into());
