@@ -303,11 +303,17 @@ async fn wait_loaded(gw: &Gateway, pick: &Pick) -> Loaded {
             if !local {
                 Discovery::ingest(&gw.disc.cluster, st.clone(), &pick.addr);
             }
-            if let Some(m) = st.models.iter().find(|m| m.id == pick.pair.model_id) {
-                match m.state {
-                    ModelState::Loaded => return Loaded::Yes,
-                    ModelState::Failed | ModelState::Available => return Loaded::Failed,
-                    _ => {}
+            match st
+                .models
+                .iter()
+                .find(|m| m.id == pick.pair.model_id)
+                .map(|m| m.state)
+            {
+                Some(ModelState::Loaded) => return Loaded::Yes,
+                Some(ModelState::Loading) => {}
+                // Відсутня (перескан прибрав файл), зупиняється, впала — цей вузол не відповість.
+                None | Some(ModelState::Failed | ModelState::Available | ModelState::Draining) => {
+                    return Loaded::Failed
                 }
             }
         }
@@ -438,7 +444,13 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
                             exclude.insert(pick.pair.clone());
                             continue;
                         }
-                        // Завантаження триває далі; клієнт хай спробує ще раз.
+                        // Приєдналися до чужого старту, а він не встиг: пробуємо інший вузол,
+                        // щоб один повільний старт не блокував тир для всіх (spec 1.3).
+                        Loaded::Pending if pick.joined => {
+                            exclude.insert(pick.pair.clone());
+                            continue;
+                        }
+                        // Старт почали ми: завантаження триває, клієнт хай спробує ще раз.
                         Loaded::Pending => {
                             return give_up(&gw, rec, started, 503, "model loading, retry")
                         }

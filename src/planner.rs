@@ -26,6 +26,8 @@ pub struct Pick {
     pub pair: Pair,
     pub addr: String,
     pub cold: bool,
+    /// Модель уже вантажилась на момент вибору: ми приєдналися до чужого старту (spec 1.3).
+    pub joined: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,17 +90,21 @@ pub fn pick(
             if exclude.contains(&pair) {
                 continue;
             }
-            let cold = match m.state {
-                ModelState::Loaded => false,
-                ModelState::Available if view.state.free_mb >= m.need_mb => true,
+            // Ранг стану: Loaded, потім Loading (чужий холодний старт уже йде, його пам'ять
+            // вузол уже врахував — free_mb не перевіряємо), потім Available, якщо влазить.
+            let rank = match m.state {
+                ModelState::Loaded => 0u8,
+                ModelState::Loading => 1,
+                ModelState::Available if view.state.free_mb >= m.need_mb => 2,
                 _ => continue,
             };
-            // Менший ключ виграє: (cold: 0 loaded / 1 available, -params_b, inflight - slots)
-            let key = (cold as u8, -m.params_b, m.inflight as i64 - m.slots as i64);
+            // Менший ключ виграє: (ранг стану, -params_b, inflight - slots)
+            let key = (rank, -m.params_b, m.inflight as i64 - m.slots as i64);
             let cand = Pick {
                 pair,
                 addr: view.state.addr.clone(),
-                cold,
+                cold: rank > 0,
+                joined: rank == 1,
             };
             let better = match &best {
                 None => true,
@@ -329,6 +335,45 @@ mod tests {
                 .node_id,
             "a"
         );
+    }
+
+    #[test]
+    fn loading_ranks_between_loaded_and_available() {
+        // Loading не потребує free_mb: пам'ять під неї вузол уже врахував.
+        let c: Cluster = HashMap::from([
+            node(
+                "a",
+                9000,
+                vec![model("m1", 1.0, ModelState::Available, 1000, 0, 1)],
+            ),
+            node(
+                "bb",
+                0,
+                vec![model("m1", 1.0, ModelState::Loading, 1000, 0, 1)],
+            ),
+        ]);
+        let p = pick(&c, &small(), &tiers(), &HashSet::new()).unwrap();
+        assert_eq!(p.pair.node_id, "bb");
+        assert!(p.cold && p.joined);
+
+        let c: Cluster = HashMap::from([
+            node(
+                "a",
+                9000,
+                vec![model("m2", 2.5, ModelState::Loading, 1000, 0, 1)],
+            ),
+            node(
+                "bb",
+                9000,
+                vec![model("m1", 1.0, ModelState::Loaded, 1000, 0, 1)],
+            ),
+        ]);
+        let p = pick(&c, &small(), &tiers(), &HashSet::new()).unwrap();
+        assert_eq!(
+            p.pair.node_id, "bb",
+            "Loaded beats Loading even with fewer params"
+        );
+        assert!(!p.cold && !p.joined);
     }
 
     #[test]

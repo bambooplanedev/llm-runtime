@@ -74,7 +74,35 @@ fn gguf(dir: &std::path::Path, name: &str, layers: u32) {
     assert!(st.success());
 }
 
+/// Налаштування демона поверх базового конфігу. `envs` отримує демон, а через
+/// успадкування — і його діти-фейки (`FAKE_LOAD_MS`, `FAKE_CHAT_STATUS`, …).
+struct Opts<'a> {
+    load_wait_secs: u64,
+    extra_toml: &'a str,
+    envs: &'a [(&'a str, &'a str)],
+}
+
+impl Default for Opts<'_> {
+    fn default() -> Self {
+        Opts {
+            load_wait_secs: 10,
+            extra_toml: "",
+            envs: &[],
+        }
+    }
+}
+
 fn spawn(port: u16, child_ports: &str, peers: &[u16], models: &[(&str, u32)]) -> Node {
+    spawn_with(port, child_ports, peers, models, Opts::default())
+}
+
+fn spawn_with(
+    port: u16,
+    child_ports: &str,
+    peers: &[u16],
+    models: &[(&str, u32)],
+    o: Opts,
+) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let mdir = dir.path().join("models");
     std::fs::create_dir_all(&mdir).unwrap();
@@ -94,20 +122,24 @@ llama_server = "{}"
 peers = [{}]
 os_reserve_mb = 0
 idle_timeout_secs = 600
-load_wait_secs = 10
+load_wait_secs = {}
 data_dir = "{}"
 llama_args = ["-c", "1024"]
+{}
 "#,
             mdir.display(),
             env!("CARGO_BIN_EXE_fake-llama-server"),
             peers.join(","),
-            dir.path().join("data").display()
+            o.load_wait_secs,
+            dir.path().join("data").display(),
+            o.extra_toml,
         ),
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_llmrt"))
         .arg(dir.path().join("llmrt.toml"))
         .env("LLMRT_FAST_TICK", "1")
+        .envs(o.envs.iter().copied())
         .stdout(logs())
         .stderr(logs())
         .spawn()
@@ -117,6 +149,20 @@ llama_args = ["-c", "1024"]
         port,
         dir,
     }
+}
+
+fn node_up(port: u16, n_models: usize) {
+    wait_for(
+        port,
+        |v| {
+            v["models"]
+                .as_array()
+                .map(|a| a.len() == n_models)
+                .unwrap_or(false)
+        },
+        "/state",
+        "node up",
+    );
 }
 
 fn get(port: u16, path: &str) -> serde_json::Value {
@@ -538,4 +584,94 @@ llama_args = ["-c", "512"]
     // Якщо це проходить лише після ~3 с (коли фейк почав писати), hyper дропає
     // future тільки на write — це допустимо, але має бути задокументовано (§9).
     eprintln!("inflight returned after {:?}", t.elapsed());
+}
+
+/// spec 1.3: другий клієнт під час холодного старту чекає разом з першим, а не отримує 503.
+/// Один вузол: з двома другий запит холодно стартував би на сусіді й тест пройшов би без виправлення.
+#[test]
+fn second_request_joins_a_cold_start_instead_of_503() {
+    let _s = serial();
+    let a = spawn_with(
+        7715,
+        "7760-7763",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            envs: &[("FAKE_LOAD_MS", "2000")],
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let first = std::thread::spawn(|| chat(7715, "small", false));
+    // Саме стан Loading раніше давав 503 AllBusy.
+    wait_for(
+        a.port,
+        |v| v["models"][0]["state"] == "loading",
+        "/state",
+        "loading",
+    );
+    let (code, body) = chat(a.port, "small", false);
+    assert_eq!(code, 200, "second request: {body}");
+    let (code, body) = first.join().unwrap();
+    assert_eq!(code, 200, "first request: {body}");
+}
+
+/// spec 1.3: запит, що приєднався до чужого старту, після load_wait_secs іде на інший вузол.
+/// Регресійний: до задачі він зелений (Loading просто пропускався), після зміни лише planner —
+/// червоний (503), після зміни gateway — знову зелений.
+#[test]
+fn joined_slow_start_falls_back_to_another_node() {
+    let _s = serial();
+    // A вантажить 6 s, а чекає 2 s; B має ту саму модель і вантажить швидко.
+    let a = spawn_with(
+        7716,
+        "7764-7767",
+        &[7717],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            load_wait_secs: 2,
+            envs: &[("FAKE_LOAD_MS", "6000")],
+            ..Default::default()
+        },
+    );
+    let b = spawn(
+        7717,
+        "7768-7771",
+        &[7716],
+        &[("tiny-0.2b.gguf", 2), ("mid-5b.gguf", 50)],
+    );
+    // mid-5b є лише на B: коли A її бачить, A бачить і B.
+    wait_for(
+        a.port,
+        |v| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "mid-5b")
+        },
+        "/v1/models",
+        "B visible on A",
+    );
+    let c = reqwest::blocking::Client::new();
+    let r = c
+        .post("http://127.0.0.1:7716/load")
+        .json(&serde_json::json!({"model": "tiny-0.2b"}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 202);
+    let (code, body) = chat(a.port, "tiny-0.2b", false);
+    assert_eq!(code, 200, "{body}");
+    wait_for(
+        b.port,
+        |v| {
+            v["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "tiny-0.2b" && m["state"] == "loaded")
+        },
+        "/state",
+        "executed on B",
+    );
 }
