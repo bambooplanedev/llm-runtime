@@ -83,12 +83,12 @@ impl Discovery {
         }
     }
 
-    /// Негайний dead — з gateway, коли з'єднання відкинуто.
-    pub fn mark_dead(cluster: &SharedCluster, node_id: &str) {
+    /// Негайний dead — з gateway, коли connect до вузла не вдався; `why` — причина для логу.
+    pub fn mark_dead(cluster: &SharedCluster, node_id: &str, why: &str) {
         let mut g = cluster.write().unwrap();
         if let Some(v) = g.get_mut(node_id) {
             if v.alive {
-                tracing::warn!("node {node_id} dead (connection refused)");
+                tracing::warn!("node {node_id} dead (connect failed: {why})");
             }
             v.alive = false;
             v.misses = MAX_MISSES;
@@ -428,7 +428,7 @@ mod tests {
     fn mark_dead_is_immediate() {
         let c: SharedCluster = Default::default();
         Discovery::ingest(&c, st("a"), "10.0.0.1:7411");
-        Discovery::mark_dead(&c, "a");
+        Discovery::mark_dead(&c, "a", "timeout");
         assert!(!c.read().unwrap()["a"].alive);
     }
 

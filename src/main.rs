@@ -111,21 +111,7 @@ async fn main() -> anyhow::Result<()> {
     let runner = Runner::new(&cfg, hw.clone(), models, node_id.clone());
     let disc = Discovery::new(node_id.clone(), cfg.port, cfg.peers.clone());
     let log = Arc::new(ReqLog::open(&cfg.data_dir.join("requests.jsonl"))?);
-    // Без глобального таймауту: генерація триває скільки треба, і кожен виклик
-    // ставить власний (`PEER_TIMEOUT`/`LOAD_TIMEOUT`/`EXEC_TIMEOUT` у gateway).
-    // Keepalive — явно: дефолти reqwest 0.13.5 (15 s / 15 s / 3, на Linux ще
-    // TCP_USER_TIMEOUT 30 s) дають ~60 s на macOS і ~30 s на Linux до виявлення вузла, що зник
-    // без RST (вимкнений Wi-Fi). Тут ~25 s на обох. Живий вузол підтверджує проби ядром навіть
-    // посеред довгого prefill, тож легітимні запити не обриваються.
-    let builder = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .tcp_keepalive(net::KEEPALIVE_IDLE)
-        .tcp_keepalive_interval(net::KEEPALIVE_INTERVAL)
-        .tcp_keepalive_retries(net::KEEPALIVE_RETRIES);
-    // На Linux TCP_USER_TIMEOUT перекриває лічильник проб — ставимо його під ті самі ~25 s.
-    #[cfg(target_os = "linux")]
-    let builder = builder.tcp_user_timeout(net::UNACKED_TIMEOUT);
-    let http = builder.build()?;
+    let http = net::peer_client_builder().build()?;
     let gw = Gateway {
         cfg: cfg.clone(),
         runner: runner.clone(),
