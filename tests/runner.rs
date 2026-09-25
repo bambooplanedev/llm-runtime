@@ -628,3 +628,46 @@ fn pin_retry_quick_only_after_stable_run() {
     // Без мітки `loaded_since` — обережно, cooldown.
     assert_eq!(pin_retry_delay(ModelState::Available, None, p), p.cooldown);
 }
+
+/// Loading longer than idle_timeout: idle time counts from Loaded, otherwise
+/// the warmup from /load would be unloaded on the first supervision tick after it becomes Loaded.
+#[tokio::test]
+async fn idle_counts_from_loaded_not_from_spawn() {
+    let mut c = cfg();
+    c.child_ports = (7630, 7630);
+    c.idle_timeout_secs = 2;
+    c.llama_server = format!("env FAKE_LOAD_MS=3000 {}", fake());
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    let state = |r: &Runner| r.snapshot().0[0].state;
+    // Loading 3 s — own budget 10 s instead of 5 s in wait_loaded.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state(&r) != ModelState::Loaded {
+        assert!(
+            Instant::now() < deadline,
+            "never loaded: {:?}",
+            r.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // After promotion; 1 s < idle 2 s with margin of 1 s for a late tick.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        state(&r),
+        ModelState::Loaded,
+        "idle must count from Loaded: load 3 s > idle 2 s"
+    );
+    // And yet it will be unloaded after idle: idle 2 s + a few ticks of 200 ms.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state(&r) != ModelState::Available {
+        assert!(
+            Instant::now() < deadline,
+            "never unloaded: {:?}",
+            r.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bg.abort();
+    r.shutdown().await;
+}

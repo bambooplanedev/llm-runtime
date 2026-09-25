@@ -682,7 +682,12 @@ impl Runner {
                                                     == Some(port) =>
                                         {
                                             s.model.entry.state = ModelState::Loaded;
-                                            s.loaded_since = Some(Instant::now());
+                                            let now = Instant::now();
+                                            s.loaded_since = Some(now);
+                                            // Idle time counts from readiness, not from spawn: otherwise
+                                            // a model loading longer than idle_timeout would be unloaded
+                                            // on the first supervision tick after becoming Loaded.
+                                            s.last_used = now;
                                             true
                                         }
                                         _ => false,
