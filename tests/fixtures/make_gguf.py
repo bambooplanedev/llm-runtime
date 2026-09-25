@@ -7,7 +7,7 @@
 embedding_length / attention.head_count.
 `--split K/N` при K>1 пише лише split.* і тензори, як llama-gguf-split.
 """
-import argparse, struct, sys
+import argparse, struct
 
 def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
 def kv_u32(k, v): return s(k) + struct.pack("<I", 4) + struct.pack("<I", v)
@@ -66,4 +66,3 @@ hdr = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", n_tensors) + struct.pac
 with open(a.out, "wb") as f:
     f.write(hdr + b"".join(kvs) + tensors)
     if a.pad_mb: f.write(b"\0" * (a.pad_mb * 1024 * 1024))
-print(a.out, file=sys.stderr)

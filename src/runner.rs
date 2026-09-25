@@ -62,6 +62,9 @@ pub const PIN_QUICK_RETRY: Duration = Duration::from_secs(5);
 /// «Стабільна робота»: стільки в `Loaded`, щоб крах не вважався циклом «завантажилась → впала».
 pub const PIN_STABLE: Duration = Duration::from_secs(300);
 
+/// Затримки повтору pinned-моделі після смерті дитини: `quick` — якщо перед смертю вона пробула
+/// в `Loaded` щонайменше `stable`; інакше `cooldown` (той самий, що для будь-якої моделі, яка
+/// впала), щоб цикл «завантажилась → впала» не крутився щосекунди.
 #[derive(Debug, Clone, Copy)]
 pub struct PinRetry {
     pub quick: Duration,
@@ -321,6 +324,11 @@ impl Runner {
             .into_iter()
             .map(|m| (m.entry.id.clone(), Slot::new(m)))
             .collect();
+        let failed_cooldown = if fast_tick() {
+            Duration::from_secs(1)
+        } else {
+            FAILED_COOLDOWN
+        };
         Runner(Arc::new(Mutex::new(Inner {
             slots,
             mem_limit_mb: hw.mem_limit_mb,
@@ -332,22 +340,18 @@ impl Runner {
             node_id,
             device: hw.device,
             cfg: cfg.clone(),
-            failed_cooldown: if fast_tick() {
-                Duration::from_secs(1)
-            } else {
-                FAILED_COOLDOWN
-            },
+            failed_cooldown,
             pin_retry: if fast_tick() {
                 PinRetry {
                     quick: Duration::from_millis(250),
                     stable: Duration::from_secs(3),
-                    cooldown: Duration::from_secs(1),
+                    cooldown: failed_cooldown,
                 }
             } else {
                 PinRetry {
                     quick: PIN_QUICK_RETRY,
                     stable: PIN_STABLE,
-                    cooldown: FAILED_COOLDOWN,
+                    cooldown: failed_cooldown,
                 }
             },
             probe_timeout: if fast_tick() {
@@ -411,6 +415,9 @@ impl Runner {
         let mut prev = initial;
         let mut warned: HashSet<String> = HashSet::new();
         let mut dir_down = false;
+        // Детермінована паніка `scan_dir` повторювалась би кожен перескан — пишемо раз, до
+        // першого успішного скану.
+        let mut scan_panicked = false;
         loop {
             tokio::time::sleep(every).await;
             let (d, p) = (dir.clone(), prev.clone());
@@ -420,6 +427,7 @@ impl Runner {
             .await;
             let out = match res {
                 Ok(Ok(out)) => {
+                    scan_panicked = false;
                     if dir_down {
                         tracing::info!("models_dir {} readable again", dir.display());
                         dir_down = false;
@@ -437,7 +445,17 @@ impl Runner {
                     }
                     continue;
                 }
-                Err(_) => continue,
+                // Скасування при завершенні рантайму — теж `JoinError`, але не помилка.
+                Err(e) => {
+                    if e.is_panic() && !scan_panicked {
+                        tracing::warn!(
+                            "models_dir {}: rescan panicked; keeping current inventory",
+                            dir.display()
+                        );
+                        scan_panicked = true;
+                    }
+                    continue;
+                }
             };
             // Warn once: той самий ключ (файл + розмір + mtime) не повторюється кожні 30 s.
             let mut now_warned = HashSet::new();

@@ -89,6 +89,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_chunk_releases_nothing_and_keeps_tail() {
+        let mut g = EventGate::default();
+        assert!(g.push(b"").is_empty());
+        assert!(g.push(b"data: a").is_empty());
+        assert!(
+            g.push(b"").is_empty(),
+            "порожній чанк не віддає притриманий хвіст"
+        );
+        assert_eq!(&g.push(b"\n\n")[..], b"data: a\n\n");
+        assert!(g.finish().is_empty());
+    }
+
+    #[test]
     fn error_event_is_valid_json_for_any_name() {
         for name in ["node7781", "mac \"m4\"", "вузол"] {
             let e = error_event(name);

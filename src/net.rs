@@ -68,11 +68,15 @@ pub mod macos {
                 &mut len,
             )
         };
-        if r == 0 {
-            Ok(v)
-        } else {
-            Err(std::io::Error::last_os_error())
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        if len as usize != std::mem::size_of::<libc::c_int>() {
+            return Err(std::io::Error::other(format!(
+                "TCP_RXT_CONNDROPTIME: getsockopt returned {len} bytes"
+            )));
+        }
+        Ok(v)
     }
 }
 

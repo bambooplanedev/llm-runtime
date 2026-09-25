@@ -167,7 +167,8 @@ revision was removed as a weight without data.
   socket sets the same keepalive and a 25 s limit on unacknowledged data (`TCP_USER_TIMEOUT` on
   Linux, `TCP_RXT_CONNDROPTIME` on macOS). A node that streams to a vanished peer drops that
   connection, which closes the child's connection and frees its slot; the node logs `stream
-  dropped by peer`.
+  dropped by peer`. The same line appears when a local client simply goes away mid-answer,
+  since local requests also reach `/exec` over loopback.
 - A non-2xx answer from the child itself comes back from `/exec` as is, marked with
   `x-llmrt-origin: child`. Gateway passes a 4xx to the client verbatim, retries a 503 on another
   pair, and turns any other 5xx into `502 "upstream failed"` with the child's message in the log.

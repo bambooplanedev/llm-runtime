@@ -11,7 +11,9 @@ fn fake() -> String {
 }
 
 fn cfg() -> Config {
-    std::env::set_var("LLMRT_FAST_TICK", "1");
+    // Один раз на процес: одночасні setenv/getenv з різних потоків тестів — UB у libc.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| std::env::set_var("LLMRT_FAST_TICK", "1"));
     let mut c = Config::load(None).unwrap();
     c.llama_server = fake();
     c.child_ports = (7600, 7603);
