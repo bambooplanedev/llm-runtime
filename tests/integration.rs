@@ -880,6 +880,50 @@ fn cli_help_and_version_exit_zero() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("--config"));
 }
 
+/// llama.cpp без `--tags` не запустить жодної дитини (невідомий аргумент). Демон мусить
+/// відмовитись стартувати з поясненням, а не крутити кожну модель через failed і cooldown.
+#[test]
+fn llama_cpp_without_tags_stops_startup() {
+    let _s = serial();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("models")).unwrap();
+    let toml = dir.path().join("llmrt.toml");
+    std::fs::write(
+        &toml,
+        format!(
+            "port = 7794\nmodels_dir = \"{}\"\nllama_server = \"{}\"\ndata_dir = \"{}\"\n",
+            dir.path().join("models").display(),
+            env!("CARGO_BIN_EXE_fake-llama-server"),
+            dir.path().join("data").display(),
+        ),
+    )
+    .unwrap();
+    let err = dir.path().join("stderr.txt");
+    let mut p = Proc(
+        Command::new(env!("CARGO_BIN_EXE_llmrt"))
+            .arg(&toml)
+            .env("FAKE_NO_TAGS", "1")
+            .stdout(logs())
+            .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let t = Instant::now();
+    let status = loop {
+        if let Some(s) = p.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "daemon must refuse to start"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+    let text = std::fs::read_to_string(&err).unwrap();
+    assert!(text.contains("--tags"), "{text}");
+}
+
 /// Дитина вмирає посеред стріму — і локально, і на сусіді клієнт дочитує тіло без
 /// помилки транспорту, а остання подія — `upstream_lost` з іменем виконавця.
 #[test]

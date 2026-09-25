@@ -329,6 +329,30 @@ pub fn probe_hw(cfg: &Config) -> anyhow::Result<Hw> {
     Ok(hw)
 }
 
+/// Маркер сиріт — `--tags`, якого старі збірки llama.cpp не знають: з ними падав би кожен
+/// старт дитини (невідомий аргумент), і модель крутилася б через failed і cooldown.
+pub fn help_has_tags(help: &str) -> bool {
+    help.contains("--tags")
+}
+
+/// Разом із `probe_hw` — друга перевірка llama.cpp на старті: без `--tags` демон не стартує.
+pub fn check_llama_features(cfg: &Config) -> anyhow::Result<()> {
+    let out = cfg.llama_cmd().arg("--help").output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if help_has_tags(&text) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "llama.cpp too old: `{} --help` has no --tags (need a build with it, verified on b11046)",
+            cfg.llama_server
+        )
+    }
+}
+
 pub fn parse_free_mb(out: &str) -> Option<u64> {
     out.lines().filter(|l| l.contains("free")).find_map(|l| {
         let inner = l.get(l.rfind('(')? + 1..l.rfind(')')?)?;
@@ -679,6 +703,17 @@ mod tests {
         assert!(!ids(&s3).contains(&"a-1b".to_string()) && s3.keep.contains("a-1b"));
 
         assert!(scan_dir(&dir.path().join("missing"), &a, None).is_err());
+    }
+
+    #[test]
+    fn help_must_list_tags() {
+        // Рядки з `llama serve --help`, llama.cpp b11046
+        let b11046 = "-a,    --alias STRING                   set model name aliases, comma-separated (to be used by API)\n\
+                      --tags STRING                           set model tags, comma-separated (informational, not used for routing)\n";
+        assert!(help_has_tags(b11046));
+        assert!(!help_has_tags(
+            "-a,    --alias STRING   set alias for model name (to be used by REST API)\n"
+        ));
     }
 
     #[test]

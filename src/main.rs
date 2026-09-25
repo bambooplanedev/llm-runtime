@@ -63,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let path = cli.config.or(cli.path);
     let cfg = Arc::new(Config::load(path.as_deref())?);
+    for w in cfg.llama_args_warnings() {
+        tracing::warn!("{w}");
+    }
     std::fs::create_dir_all(&cfg.data_dir)?;
 
     // node_id: один раз, на диску
@@ -84,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("PATH").unwrap_or_default()
         )
     })?;
+    inventory::check_llama_features(&cfg)?;
     Runner::kill_orphans(&node_id);
 
     let args = cfg.parse_llama_args();
