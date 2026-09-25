@@ -698,7 +698,7 @@ fn second_request_joins_a_cold_start_instead_of_503() {
 }
 
 /// Запит, що приєднався до чужого старту, після load_wait_secs іде на інший вузол.
-/// Регресійний: до задачі він зелений (Loading просто пропускався), після зміни лише planner —
+/// Регресійний: до зміни він зелений (Loading просто пропускався), після зміни лише planner —
 /// червоний (503), після зміни gateway — знову зелений.
 #[test]
 fn joined_slow_start_falls_back_to_another_node() {

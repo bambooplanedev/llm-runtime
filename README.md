@@ -70,7 +70,7 @@ mem_limit_mb = 32768                   # default: from --list-devices; overrides
 | `os_reserve_mb` | 2048 Metal / 1024 CUDA | Memory kept free for the OS |
 | `mem_limit_mb` | from `--list-devices` | Memory cap for loaded models; overrides the device value |
 | `load_wait_secs` | `120` | How long to wait for a child to become ready |
-| `idle_timeout_secs` | `600` | Unload a model after this much idle time |
+| `idle_timeout_secs` | `600` | Unload a model after this much idle time, counted from when it became ready (Loaded) or its last request, whichever is later |
 | `tiers` | `{ small = 3.0, medium = 12.0 }` | Tier boundaries in billions of parameters |
 | `pin` | `[]` | Model ids to keep loaded; reloaded after a crash |
 | `data_dir` | `~/.llmrt` | Holds `node_id` and `requests.jsonl` |

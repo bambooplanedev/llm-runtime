@@ -233,11 +233,12 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
   process exits, and the model is not picked then; with a single copy that is a brief `503`.
   Pinned models never stop.
 - **Health.** While `loading`, `GET /health` every 5 s. For `loaded` children only process exit is
-  checked: llama-server answers `/health` from its HTTP thread and does not notice a hung
-  inference loop. A dead child goes back to `available` (`failed` if it died while loading), and
-  the transition is logged as a warning. Pinned models are reloaded by the background loop. After
-  a crash that follows at least 5 minutes in `loaded` the next attempt comes 5 s later; after a
-  crash while loading, a crash shortly after loading, or a failed attempt it waits `FAILED_COOLDOWN`.
+  checked: llama-server answers `/health` from its HTTP thread and does not notice a hung inference
+  loop. A dead child goes back to `available` (`failed` if it died while loading), and the
+  transition is logged as a warning with the child's exit status (e.g. `exit status: 101` or
+  `signal: 9`). Pinned models are reloaded by the background loop. After a crash that follows at
+  least 5 minutes in `loaded` the next attempt comes 5 s later; after a crash while loading, a crash
+  shortly after loading, or a failed attempt it waits `FAILED_COOLDOWN`.
 - **Rescan.** Every 30 s the daemon rescans `models_dir`. A new or changed file is used only when
   its size and mtime match on two scans in a row, so a file still being copied is not announced.
   A removed file drops its model once no process runs it; a changed file replaces the model once

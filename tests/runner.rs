@@ -18,9 +18,12 @@ fn cfg() -> Config {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         std::env::set_var("LLMRT_FAST_TICK", "1");
-        // Явний фільтр: без RUST_LOG `fmt::try_init()` з env-filter показав би лише ERROR, а при
-        // падінні потрібні warn/info runner-а (лог смерті дочірнього процесу, «cooldown over», «idle, stopping»).
-        // `with_test_writer` пише через print!, тож libtest показує лог лише впалого тесту.
+        // Явний фільтр: без RUST_LOG `fmt::try_init()` з env-filter показав
+        // би лише ERROR, а при падінні потрібні warn/info runner-а
+        // (лог смерті дочірнього процесу, «cooldown over»,
+        // «idle, stopping»).
+        // `with_test_writer` пише через print!, тож libtest показує лог
+        // лише впалого тесту.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new("llmrt=debug"))
             .with_test_writer()
@@ -365,7 +368,9 @@ async fn kill_child(j: &std::path::Path, r: &Runner) {
 
 /// Pinned-дитина, вбита ззовні, повертається. Щойно завантажена — не раніше
 /// cooldown (цикл OOM); після стабільної роботи (fast `stable` = 3 s) — швидко. Точні паузи
-/// перевіряє `pin_retry_quick_only_after_stable_run`; тут точних таймінгів не перевіряємо, бо під навантаженням вони ненадійні.
+/// перевіряє `pin_retry_quick_only_after_stable_run`; тут точних
+/// таймінгів не перевіряємо, бо під навантаженням вони
+/// ненадійні.
 #[tokio::test]
 async fn pinned_child_killed_externally_comes_back() {
     let j = tempfile::NamedTempFile::new().unwrap();
