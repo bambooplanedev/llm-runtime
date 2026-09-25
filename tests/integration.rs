@@ -316,7 +316,8 @@ fn two_nodes_route_by_tier_and_survive_peer_death() {
     );
     // /state сусіда: proto і free_mb
     let st = get(b.port, "/state");
-    assert_eq!(st["proto"], 1);
+    assert_eq!(st["proto"], 2);
+    assert_eq!(st["hw"]["device_name"], "Fake M4", "{st}");
     assert!(st["free_mb"].as_u64().unwrap() > 0);
 
     // 2. small через A → виконується на A локально (холодний старт, 202 + очікування)
@@ -475,7 +476,7 @@ llama_args = ["-c", "512"]
         .unwrap();
     assert_eq!(r.status().as_u16(), 409, "second model does not fit");
     let body: serde_json::Value = r.json().unwrap();
-    assert_eq!(body["proto"], 1, "409 carries fresh /state");
+    assert_eq!(body["proto"], 2, "409 carries fresh /state");
     let r = c
         .post("http://127.0.0.1:7713/exec")
         .json(&serde_json::json!({"model":"q-1b","body":{}}))

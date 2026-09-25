@@ -205,8 +205,8 @@ const GPU_PREFIXES: [&str; 5] = ["MTL", "CUDA", "Vulkan", "ROCm", "HIP"];
 /// без GPU — перший рядок з ненульовим total (CPU-збірка).
 pub fn parse_list_devices(out: &str) -> Hw {
     let mut hw = Hw {
-        cpu: String::new(),
         device: "CPU".into(),
+        device_name: String::new(),
         mem_limit_mb: 0,
     };
     for line in out.lines() {
@@ -232,7 +232,7 @@ pub fn parse_list_devices(out: &str) -> Hw {
         if is_gpu || (hw.mem_limit_mb == 0 && total > 0) {
             hw.device = name.trim().to_string();
             hw.mem_limit_mb = total; // для MTL це робочий набір Metal, не RAM
-            hw.cpu = rest[..open].trim().to_string();
+            hw.device_name = rest[..open].trim().to_string();
             if is_gpu {
                 break;
             }
@@ -574,13 +574,16 @@ mod tests {
         let rocm = "Available devices:\n  ROCm0: AMD Radeon RX 7900 XTX (RADV NAVI31) (24560 MiB, 24000 MiB free)\n";
         let hw = parse_list_devices(rocm);
         assert_eq!(hw.device, "ROCm0");
-        assert_eq!(hw.cpu, "AMD Radeon RX 7900 XTX (RADV NAVI31)");
+        assert_eq!(hw.device_name, "AMD Radeon RX 7900 XTX (RADV NAVI31)");
         assert_eq!(hw.mem_limit_mb, 24560);
         assert_eq!(parse_free_mb(rocm), Some(24000));
         assert_eq!(default_os_reserve(&hw), 1024);
         let vk = "  Vulkan0: Intel(R) Arc(TM) A770 Graphics (8128 MiB, 8000 MiB free)\n";
         assert_eq!(parse_list_devices(vk).mem_limit_mb, 8128);
-        assert_eq!(parse_list_devices(vk).cpu, "Intel(R) Arc(TM) A770 Graphics");
+        assert_eq!(
+            parse_list_devices(vk).device_name,
+            "Intel(R) Arc(TM) A770 Graphics"
+        );
         // ')' перед '(' — не паніка, а пропуск рядка
         let bad = "X: broken ) foo ( bar\nY: also ) broken ( free\n";
         assert_eq!(parse_list_devices(bad).mem_limit_mb, 0);
@@ -605,7 +608,7 @@ mod tests {
         let out = "Available devices:\n  MTL0: Apple M4 (12124 MiB, 12123 MiB free)\n  BLAS: Accelerate (0 MiB, 0 MiB free)\n";
         let hw = parse_list_devices(out);
         assert_eq!(hw.device, "MTL0");
-        assert_eq!(hw.cpu, "Apple M4");
+        assert_eq!(hw.device_name, "Apple M4");
         assert_eq!(hw.mem_limit_mb, 12124);
         assert_eq!(default_os_reserve(&hw), 2048);
         assert_eq!(parse_free_mb(out), Some(12123));

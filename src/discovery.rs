@@ -361,8 +361,8 @@ mod tests {
             addr: "x".into(),
             version: "0".into(),
             hw: Hw {
-                cpu: "".into(),
                 device: "CPU".into(),
+                device_name: "".into(),
                 mem_limit_mb: 1,
             },
             models: vec![],
