@@ -637,23 +637,27 @@ impl Runner {
                         .get_mut(&id)
                         .and_then(|s| s.proc_.as_mut())
                         .filter(|p| p.port == port)
-                        .map(|p| p.child.try_wait().ok().flatten().is_some())
+                        .map(|p| p.child.try_wait().ok().flatten())
                 };
                 // No process under this id/port any more: shutdown() or an idle stop got there
                 // first, so there is nothing to supervise and `st` is stale. Never touch the state.
-                let Some(dead) = probe else { continue };
-                if dead {
+                let Some(exited) = probe else { continue };
+                if let Some(status) = exited {
                     let next = if st == ModelState::Loading {
                         ModelState::Failed
                     } else {
                         ModelState::Available
                     };
                     let retry = self.0.lock().unwrap().kill(&id, next);
+                    // Статус — у кінці рядка: `exit status: 101` (паніка, напр. порт зайнятий)
+                    // відрізняється від `signal: 9 (SIGKILL)`; початок рядка лишається тим самим.
                     match retry {
                         Some(d) => tracing::warn!(
-                            "{id}: llama-server exited while {st:?} -> {next:?}, pinned: retry in {d:?}"
+                            "{id}: llama-server exited while {st:?} -> {next:?}, pinned: retry in {d:?} ({status})"
                         ),
-                        None => tracing::warn!("{id}: llama-server exited while {st:?} -> {next:?}"),
+                        None => tracing::warn!(
+                            "{id}: llama-server exited while {st:?} -> {next:?} ({status})"
+                        ),
                     }
                     continue;
                 }

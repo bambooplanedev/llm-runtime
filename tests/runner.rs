@@ -13,7 +13,16 @@ fn fake() -> String {
 fn cfg() -> Config {
     // Один раз на процес: одночасні setenv/getenv з різних потоків тестів — UB у libc.
     static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| std::env::set_var("LLMRT_FAST_TICK", "1"));
+    INIT.call_once(|| {
+        std::env::set_var("LLMRT_FAST_TICK", "1");
+        // Явний фільтр: без RUST_LOG `fmt::try_init()` з env-filter показав би лише ERROR, а при
+        // падінні потрібні warn/info runner-а (лог смерті дочірнього процесу, «cooldown over», «idle, stopping»).
+        // `with_test_writer` пише через print!, тож libtest показує лог лише впалого тесту.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("llmrt=debug"))
+            .with_test_writer()
+            .try_init();
+    });
     let mut c = Config::load(None).unwrap();
     c.llama_server = fake();
     c.child_ports = (7600, 7603);
