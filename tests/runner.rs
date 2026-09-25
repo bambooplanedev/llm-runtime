@@ -1,7 +1,7 @@
 use llmrt::config::Config;
 use llmrt::gguf::GgufMeta;
 use llmrt::inventory::LocalModel;
-use llmrt::runner::{should_idle_stop, ExecTarget, LoadOutcome, Runner};
+use llmrt::runner::{pin_retry_delay, should_idle_stop, ExecTarget, LoadOutcome, PinRetry, Runner};
 use llmrt::state::{Hw, ModelEntry, ModelState};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -331,7 +331,27 @@ async fn cuda_probe_timeout_returns_spawn_failed() {
     panic!("fake-llama-server --list-devices still running after kill_on_drop");
 }
 
-/// spec 2.6: pinned-модель, чию дитину вбито ззовні, повертається сама.
+/// `kill -9` дитини з pid із `FAKE_MODEL_JSON`; повертає, коли runner помітив смерть.
+async fn kill_child(j: &std::path::Path, r: &Runner) {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(j).unwrap()).unwrap();
+    let pid = v["pid"].as_u64().unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    // Спершу дочекатися, що смерть помічено: інакше wait_loaded побачив би старий Loaded.
+    for _ in 0..100 {
+        if r.snapshot().0[0].state != ModelState::Loaded {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("death must be noticed");
+}
+
+/// spec 2.6 + B1 §3: pinned-дитина, вбита ззовні, повертається. Щойно завантажена — не раніше
+/// cooldown (цикл OOM); після стабільної роботи (fast `stable` = 3 s) — швидко. Точні паузи
+/// перевіряє `pin_retry_quick_only_after_stable_run`; тут таймінгів не міряємо (урок флейка A).
 #[tokio::test]
 async fn pinned_child_killed_externally_comes_back() {
     let j = tempfile::NamedTempFile::new().unwrap();
@@ -342,35 +362,28 @@ async fn pinned_child_killed_externally_comes_back() {
     let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
     let bg = tokio::spawn(r.clone().run_background());
     wait_loaded(&r, "a").await;
-    let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(j.path()).unwrap()).unwrap();
-    let pid = v["pid"].as_u64().unwrap();
-    std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .unwrap();
-    // Спершу дочекатися, що смерть помічено: інакше wait_loaded побачив би старий Loaded.
-    for _ in 0..100 {
-        if r.snapshot().0[0].state != ModelState::Loaded {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_ne!(
-        r.snapshot().0[0].state,
-        ModelState::Loaded,
-        "death must be noticed"
-    );
-    // Backoff: cooldown — 1 s під fast tick, тож 500 мс по смерті модель ще не пробує вантажитись.
+
+    // Пробула в Loaded < 3 s: cooldown 1 s, тож 500 мс по смерті модель ще не пробує вантажитись.
+    kill_child(j.path(), &r).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         !matches!(
             r.snapshot().0[0].state,
             ModelState::Loading | ModelState::Loaded
         ),
-        "pin must not retry before FAILED_COOLDOWN"
+        "a pin that crashed right after loading must wait FAILED_COOLDOWN"
     );
     wait_loaded(&r, "a").await; // cooldown 1 s + завантаження
+
+    // Стабільна робота > 3 s, потім крах — швидкий повтор (250 ms) і знову Loaded.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    kill_child(j.path(), &r).await;
+    let t = Instant::now();
+    wait_loaded(&r, "a").await;
+    eprintln!(
+        "pin back in Loaded {:?} after a crash in stable run",
+        t.elapsed()
+    );
     bg.abort();
     r.shutdown().await;
 }
@@ -568,4 +581,36 @@ fn idle_stop_decision() {
         !should_idle_stop(&e, old, now, idle, false),
         "already stopping"
     );
+}
+
+/// B1 §3: швидкий повтор — лише для pinned-моделі, що впала після стабільної роботи в `Loaded`.
+#[test]
+fn pin_retry_quick_only_after_stable_run() {
+    let p = PinRetry {
+        quick: Duration::from_secs(5),
+        stable: Duration::from_secs(300),
+        cooldown: Duration::from_secs(60),
+    };
+    // Смерть під час Loading — OOM-захист, завжди cooldown.
+    assert_eq!(pin_retry_delay(ModelState::Failed, None, p), p.cooldown);
+    assert_eq!(
+        pin_retry_delay(ModelState::Failed, Some(Duration::from_secs(900)), p),
+        p.cooldown
+    );
+    // Стабільна робота (межа включно) — швидкий повтор.
+    assert_eq!(
+        pin_retry_delay(ModelState::Available, Some(Duration::from_secs(300)), p),
+        p.quick
+    );
+    assert_eq!(
+        pin_retry_delay(ModelState::Available, Some(Duration::from_secs(3600)), p),
+        p.quick
+    );
+    // Щойно завантажилась і впала — цикл, cooldown.
+    assert_eq!(
+        pin_retry_delay(ModelState::Available, Some(Duration::from_secs(299)), p),
+        p.cooldown
+    );
+    // Без мітки `loaded_since` — обережно, cooldown.
+    assert_eq!(pin_retry_delay(ModelState::Available, None, p), p.cooldown);
 }
