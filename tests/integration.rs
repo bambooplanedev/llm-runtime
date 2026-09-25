@@ -139,17 +139,19 @@ llama_args = ["-c", "1024"]
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_llmrt"))
-        .arg(dir.path().join("llmrt.toml"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_llmrt"));
+    cmd.arg(dir.path().join("llmrt.toml"))
         .env("LLMRT_FAST_TICK", "1")
         .envs(o.envs.iter().copied())
-        .stdout(match o.log_file {
+        .stdout(match &o.log_file {
             Some(p) => Stdio::from(std::fs::File::create(p).unwrap()),
             None => logs(),
         })
-        .stderr(logs())
-        .spawn()
-        .unwrap();
+        .stderr(logs());
+    if o.log_file.is_some() {
+        cmd.env("RUST_LOG", "llmrt=info");
+    }
+    let child = cmd.spawn().unwrap();
     Node {
         _proc: Proc(child),
         port,
@@ -319,6 +321,10 @@ fn two_nodes_route_by_tier_and_survive_peer_death() {
     assert_eq!(code, 200, "{text}");
     assert!(text.contains("tok0"), "{text}");
     assert!(text.contains("\"usage\""), "include_usage injected: {text}");
+    assert!(
+        text.trim_end().ends_with("data: [DONE]"),
+        "normal stream must still end with [DONE]: {text}"
+    );
 
     // 3. medium через A → на B. Модель B стала loaded, inflight повернувся в 0
     let (code, text) = chat(a.port, "medium", false);

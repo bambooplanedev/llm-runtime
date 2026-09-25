@@ -643,8 +643,8 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             }
         };
 
-        // Стрім до клієнта байт-у-байт: чанки не розбираємо, лише підглядаємо
-        // usage/timings. TTFT — перший байт; рядок логу — у `Finish::drop`.
+        // Клієнту — лише цілі SSE-події (EventGate); usage/timings підглядаємо в сирих чанках.
+        // TTFT — перший сирий байт; рядок логу — у `Finish::drop`.
         let ct = up.headers().get(header::CONTENT_TYPE).cloned();
         rec.status = 200;
         let fin = Finish {
