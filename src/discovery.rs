@@ -226,28 +226,40 @@ impl Discovery {
         out
     }
 
-    /// Застосувати результат однієї проби. `known_id` — кого ми очікували на цих адресах.
-    /// Повертає node_id того, хто реально відповів (якщо це не ми самі).
+    /// Застосувати результат однієї проби. `known_id` — кого ми очікували на цих адресах
+    /// (`run` передає його ж як `want`, тож `hit` при відомому id — завжди від нього).
+    /// Повертає `(адреса, node_id)` усіх, хто відповів, крім нас самих.
     ///
-    /// Хто відповів, той і потрапляє в cluster; якщо це не очікуваний вузол (адресу переїхав
-    /// інший хост через DHCP), очікуваному зараховується пропуск — інакше він лишався б
-    /// «живим» зі старими даними назавжди.
+    /// Хто відповів, той і потрапляє в cluster. Очікуваний вузол, що не відповів з жодної
+    /// адреси, отримує пропуск — навіть коли на його старій адресі тепер відповідає інший
+    /// (DHCP), інакше він лишався б «живим» зі старими даними назавжди.
     fn apply_probe(
         &self,
         known_id: Option<&str>,
-        got: Option<(String, NodeState)>,
+        probe: Probe,
         last_proto_warn: &mut HashMap<String, Instant>,
-    ) -> Option<String> {
-        let Some((addr, st)) = got else {
+    ) -> Vec<(String, String)> {
+        if probe.hit.is_none() {
             if let Some(id) = known_id {
                 Self::miss(&self.cluster, id);
             }
-            return None;
-        };
-        if let Some(id) = known_id.filter(|id| *id != st.node_id) {
-            Self::miss(&self.cluster, id);
         }
-        // відповіли ми самі (seed показує на нас) — ігноруємо
+        probe
+            .hit
+            .into_iter()
+            .chain(probe.others)
+            .filter_map(|(addr, st)| self.accept(addr, st, last_proto_warn))
+            .collect()
+    }
+
+    /// Одна відповідь: себе ігноруємо (seed показує на нас), чужий `proto` — warning не
+    /// частіше раза на хвилину, і вузол однаково в cluster: відсіює його `planner::pick`.
+    fn accept(
+        &self,
+        addr: String,
+        st: NodeState,
+        last_proto_warn: &mut HashMap<String, Instant>,
+    ) -> Option<(String, String)> {
         if st.node_id == self.self_id {
             return None;
         }
@@ -263,10 +275,9 @@ impl Discovery {
             );
             last_proto_warn.insert(st.node_id.clone(), Instant::now());
         }
-        // вузол із чужим proto все одно видимий; відсіює його planner::pick
         let id = st.node_id.clone();
         Self::ingest(&self.cluster, st, &addr);
-        Some(id)
+        Some((addr, id))
     }
 
     /// Анонс, browse і вічний цикл опитування `/state`. Не повертається.
@@ -305,16 +316,17 @@ impl Discovery {
 
             // 2. проби — паралельно: інакше кожен недоступний вузол з'їдав би свої 2 с
             // з 3-секундного такту
-            let probes = due.iter().map(|(_, addrs)| probe_addrs(&http, addrs));
+            let probes = due
+                .iter()
+                .map(|(id, addrs)| probe_addrs(&http, addrs, id.as_deref()));
             let results = futures_util::future::join_all(probes).await;
 
             // 3. застосувати результати — послідовно, під короткими блокуваннями
-            for ((known_id, _), got) in due.into_iter().zip(results) {
-                let answered_at = got.as_ref().map(|(a, _)| a.clone());
-                let answered = self.apply_probe(known_id.as_deref(), got, &mut last_proto_warn);
-                // якщо відповіла саме seed-адреса — перепривʼязуємо її до того, хто відповів:
+            for ((known_id, _), probe) in due.into_iter().zip(results) {
+                let answered = self.apply_probe(known_id.as_deref(), probe, &mut last_proto_warn);
+                // seed-адресу, що відповіла, перепривʼязуємо до того, хто на ній відповів:
                 // адресу міг перебрати інший вузол, і тоді стара привʼязка бреше
-                if let (Some(addr), Some(id)) = (answered_at, answered) {
+                for (addr, id) in answered {
                     if self.seeds.contains(&addr) {
                         seed_ids.insert(addr, id);
                     }
@@ -325,9 +337,20 @@ impl Discovery {
     }
 }
 
-/// Паралельно GET `/state` на всі адреси; перемагає та, що **відповіла першою** з валідним
-/// `NodeState`. Решта проб скасовуються, тож швидка адреса не чекає на таймаут повільної.
-pub async fn probe_addrs(http: &reqwest::Client, addrs: &[String]) -> Option<(String, NodeState)> {
+/// Відповіді з адрес одного вузла.
+#[derive(Debug, Default)]
+pub struct Probe {
+    /// Відповідь очікуваного вузла; при `want = None` — перша будь-яка.
+    pub hit: Option<(String, NodeState)>,
+    /// Відповіді інших вузлів з цих самих адрес (стару адресу перебрав інший хост).
+    pub others: Vec<(String, NodeState)>,
+}
+
+/// Паралельно GET `/state` на всі адреси. Перемагає перша відповідь **очікуваного** вузла
+/// (`want`), решта проб скасовується. Чужі відповіді збираються в `others`, і пошук триває:
+/// інакше швидкий чужий вузол на старій адресі затіняв би свого на новій, і той отримував би
+/// пропуски аж до dead. `want = None` — невпізнаний seed: перша валідна відповідь.
+pub async fn probe_addrs(http: &reqwest::Client, addrs: &[String], want: Option<&str>) -> Probe {
     let mut futs: FuturesUnordered<_> = addrs
         .iter()
         .map(|a| {
@@ -340,12 +363,16 @@ pub async fn probe_addrs(http: &reqwest::Client, addrs: &[String]) -> Option<(St
             }
         })
         .collect();
+    let mut out = Probe::default();
     while let Some(r) = futs.next().await {
-        if r.is_some() {
-            return r; // решта futures дропаються разом із FuturesUnordered
+        let Some((a, st)) = r else { continue };
+        if want.is_none_or(|w| w == st.node_id) {
+            out.hit = Some((a, st));
+            return out; // решта futures дропаються разом із FuturesUnordered
         }
+        out.others.push((a, st));
     }
-    None
+    out
 }
 
 #[cfg(test)]
@@ -405,16 +432,19 @@ mod tests {
         assert!(!c.read().unwrap()["a"].alive);
     }
 
-    /// DHCP віддав адресу `b` іншому хосту: відповідь від `c` не робить `b` живим.
+    /// На старій адресі B відповідає C, сам B мовчить: B — пропуск, C — у cluster.
     #[test]
     fn answer_from_another_node_misses_the_expected_one() {
         let d = Discovery::new("me".into(), 7411, vec![]);
         Discovery::ingest(&d.cluster, st("b"), "10.0.0.1:7411");
         let mut warn = HashMap::new();
-        let got = Some(("10.0.0.1:7411".to_string(), st("c")));
+        let p = Probe {
+            hit: None,
+            others: vec![("10.0.0.1:7411".to_string(), st("c"))],
+        };
         assert_eq!(
-            d.apply_probe(Some("b"), got, &mut warn).as_deref(),
-            Some("c")
+            d.apply_probe(Some("b"), p, &mut warn),
+            [("10.0.0.1:7411".to_string(), "c".to_string())]
         );
         let g = d.cluster.read().unwrap();
         assert_eq!(g["b"].misses, 1, "той, кого чекали, пропустив опитування");
@@ -424,17 +454,86 @@ mod tests {
         );
     }
 
+    /// DHCP віддав стару адресу B вузлу C, а B переїхав і відповів з нової: B живий без
+    /// пропуску, C теж у cluster, обидві адреси повернуто для перепривʼязки seed.
+    #[test]
+    fn expected_node_answered_elsewhere_is_not_missed() {
+        let d = Discovery::new("me".into(), 7411, vec![]);
+        Discovery::ingest(&d.cluster, st("b"), "10.0.0.1:7411");
+        let mut warn = HashMap::new();
+        let p = Probe {
+            hit: Some(("10.0.0.2:7411".to_string(), st("b"))),
+            others: vec![("10.0.0.1:7411".to_string(), st("c"))],
+        };
+        assert_eq!(
+            d.apply_probe(Some("b"), p, &mut warn),
+            [
+                ("10.0.0.2:7411".to_string(), "b".to_string()),
+                ("10.0.0.1:7411".to_string(), "c".to_string())
+            ]
+        );
+        let g = d.cluster.read().unwrap();
+        assert_eq!(g["b"].misses, 0);
+        assert_eq!(g["b"].state.addr, "10.0.0.2:7411");
+        assert_eq!(g["c"].state.addr, "10.0.0.1:7411");
+    }
+
     #[test]
     fn failed_probe_misses_and_own_state_is_not_ingested() {
         let d = Discovery::new("me".into(), 7411, vec![]);
         Discovery::ingest(&d.cluster, st("b"), "10.0.0.1:7411");
         let mut warn = HashMap::new();
-        assert_eq!(d.apply_probe(Some("b"), None, &mut warn), None);
+        assert!(d
+            .apply_probe(Some("b"), Probe::default(), &mut warn)
+            .is_empty());
         assert_eq!(d.cluster.read().unwrap()["b"].misses, 1);
         // seed показує на нас самих — у cluster ми не потрапляємо
-        let mine = Some(("10.0.0.9:7411".to_string(), st("me")));
-        assert_eq!(d.apply_probe(None, mine, &mut warn), None);
+        let mine = Probe {
+            hit: Some(("10.0.0.9:7411".to_string(), st("me"))),
+            others: vec![],
+        };
+        assert!(d.apply_probe(None, mine, &mut warn).is_empty());
         assert!(!d.cluster.read().unwrap().contains_key("me"));
+    }
+
+    /// `/state`-сервер на випадковому порту: відповідає `st(id)` із затримкою.
+    async fn state_server(id: &'static str, delay_ms: u64) -> String {
+        let app = axum::Router::new().route(
+            "/state",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                axum::Json(st(id))
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        addr
+    }
+
+    /// Чужий вузол відповідає швидше за свого — перемагає свій, чужий іде в `others`.
+    #[tokio::test]
+    async fn probe_waits_for_the_expected_node() {
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let c = state_server("c", 0).await;
+        let b = state_server("b", 200).await;
+
+        let p = probe_addrs(&http, &[c.clone(), b.clone()], Some("b")).await;
+        let (addr, s) = p.hit.expect("expected node answered");
+        assert_eq!((addr.as_str(), s.node_id.as_str()), (b.as_str(), "b"));
+        assert_eq!(p.others.len(), 1);
+        assert_eq!(
+            (p.others[0].0.as_str(), p.others[0].1.node_id.as_str()),
+            (c.as_str(), "c")
+        );
+
+        let p = probe_addrs(&http, std::slice::from_ref(&c), Some("b")).await;
+        assert!(p.hit.is_none(), "only another node answered");
+        assert_eq!(p.others.len(), 1);
+
+        let p = probe_addrs(&http, &[b.clone(), c.clone()], None).await;
+        assert_eq!(p.hit.expect("first answer").1.node_id, "c");
+        assert!(p.others.is_empty());
     }
 
     /// Seed і mDNS для одного вузла — один кандидат з обома адресами, інакше seed зі
