@@ -887,6 +887,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "tokio",
  "toml",

@@ -42,6 +42,11 @@ cargo build --release          # ./target/release/llmrt
 Copy GGUF files into `models_dir` (default `~/models`). Split models
 (`name-00001-of-00003.gguf` …) are one model; keep all shards in the same directory.
 
+To split a model yourself, use `llama-gguf-split` (for example `--split-max-size 4G`). The `llama`
+launcher does not ship it; the numbered llama.cpp release archives
+(`llama-bNNNN-bin-<os>-<arch>.tar.gz` on the llama.cpp GitHub releases page) do. Unpack one into a
+temporary directory and run the tool from there; nothing needs to be installed.
+
 The daemon rescans the directory every 30 s. A new file appears once its size has stopped
 changing between two scans. **Replace a model with `mv`, not by copying over it**: a running
 `llama-server` has the old file memory-mapped, and overwriting it in place can crash that child.
@@ -77,6 +82,12 @@ mem_limit_mb = 11264              # leave headroom for the desktop / other GPU u
 
 `mem_limit_mb` overrides what `--list-devices` reports on any device. On CUDA the daemon also
 checks real free VRAM before each load, so a value above the card's memory is still capped by it.
+
+`llama_args` apply to every model on the node, and `-c` sets the context of each. The KV cache
+for that context is part of the memory the daemon reserves per model (`need_mb` in `/state`), so
+a larger `-c` means fewer models fit at once. A prompt longer than the context gets `400
+exceed_context_size_error`. With 8 GB of VRAM and a 9B model, raise `-c` from a small value
+step by step and compare `need_mb` with `free_mb` in `/state`.
 
 Run two daemons on one host only with disjoint `child_ports` and separate `data_dir`.
 
@@ -140,4 +151,5 @@ and model that executed it.
 | A model disappears from `/v1/models` for about a minute | It failed to load and is cooling down before the next attempt |
 | A new GGUF does not show up | Wait two rescans (~60 s); a file still being copied is not announced |
 | A request hangs ~25 s before the first token, then goes to another node | The chosen node dropped off the network before answering; the request is retried elsewhere |
-| A stream hangs ~25 s and then errors out mid-answer | The executing node dropped off the network after tokens had already started; the client sees `upstream_lost` and must retry itself |
+| A stream hangs ~25 s and then ends with an `error` event | The executing node dropped off the network after tokens had already started. The last SSE event is `{"error":{"type":"upstream_lost",…}}` with no `[DONE]`; the OpenAI SDKs raise `APIError`. A hand-written client must handle that event or require `[DONE]`, or it will take the cut answer as complete |
+| A client that stops reading for a while is disconnected | On Linux ≥ 5.11 the daemon drops a connection whose sent data stays unacknowledged for 25 s; this frees the model slot when a peer vanishes, but also cuts a live client that stops reading that long. Read the stream continuously |
