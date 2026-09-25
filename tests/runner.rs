@@ -629,8 +629,8 @@ fn pin_retry_quick_only_after_stable_run() {
     assert_eq!(pin_retry_delay(ModelState::Available, None, p), p.cooldown);
 }
 
-/// Loading longer than idle_timeout: idle time counts from Loaded, otherwise
-/// the warmup from /load would be unloaded on the first supervision tick after it becomes Loaded.
+/// Завантаження довше за idle_timeout: простій рахується від `Loaded`, інакше `/load`-прогрів
+/// вивантажується на першому ж такті після завантаження.
 #[tokio::test]
 async fn idle_counts_from_loaded_not_from_spawn() {
     let mut c = cfg();
@@ -641,7 +641,7 @@ async fn idle_counts_from_loaded_not_from_spawn() {
     let bg = tokio::spawn(r.clone().run_background());
     assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
     let state = |r: &Runner| r.snapshot().0[0].state;
-    // Loading 3 s — own budget 10 s instead of 5 s in wait_loaded.
+    // Завантаження 3 s — власний бюджет 10 s замість 5 s у wait_loaded.
     let deadline = Instant::now() + Duration::from_secs(10);
     while state(&r) != ModelState::Loaded {
         assert!(
@@ -651,14 +651,14 @@ async fn idle_counts_from_loaded_not_from_spawn() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // After promotion; 1 s < idle 2 s with margin of 1 s for a late tick.
+    // Помічено ≥ промоції; 1 s < idle 2 s з запасом у 1 s на запізнілий такт.
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(
         state(&r),
         ModelState::Loaded,
         "idle must count from Loaded: load 3 s > idle 2 s"
     );
-    // And yet it will be unloaded after idle: idle 2 s + a few ticks of 200 ms.
+    // І все ж вивантажується після простою: idle 2 s + кілька тактів по 200 ms.
     let deadline = Instant::now() + Duration::from_secs(5);
     while state(&r) != ModelState::Available {
         assert!(

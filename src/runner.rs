@@ -684,9 +684,9 @@ impl Runner {
                                             s.model.entry.state = ModelState::Loaded;
                                             let now = Instant::now();
                                             s.loaded_since = Some(now);
-                                            // Idle time counts from readiness, not from spawn: otherwise
-                                            // a model loading longer than idle_timeout would be unloaded
-                                            // on the first supervision tick after becoming Loaded.
+                                            // Простій — від готовності, не від spawn: інакше
+                                            // модель, що вантажилась довше за idle_timeout,
+                                            // вивантажується на першому ж такті.
                                             s.last_used = now;
                                             true
                                         }
