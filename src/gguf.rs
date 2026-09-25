@@ -49,7 +49,7 @@ impl R<'_> {
         Ok(String::from_utf8_lossy(&v).into_owned())
     }
     /// Читає значення типу `t`; повертає число, якщо воно скалярне і ціле.
-    /// `depth` — глибина вкладених масивів: без межі битий файл кладе стек рекурсією (§7).
+    /// `depth` — глибина вкладених масивів: без межі битий файл кладе стек рекурсією.
     fn value(&mut self, t: u32, depth: u32) -> Result<Option<u64>> {
         Ok(match t {
             0 => Some(self.u8()? as u64),
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(m.expert_used, Some(8));
     }
 
-    /// Шард 2..N від llama-gguf-split: лише split.* і tensor-info, без block_count (spec 2.1).
+    /// Шард 2..N від llama-gguf-split: лише split.* і tensor-info, без block_count.
     #[test]
     fn secondary_shard_without_metadata_is_ok() {
         let f = fixture(&[
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(m.head_dim, 128);
     }
 
-    /// Заголовок валідний, n_kv — сміття: мусить бути Err, не паніка (спека §7).
+    /// Заголовок валідний, n_kv — сміття: мусить бути Err, не паніка.
     #[test]
     fn rejects_absurd_kv_count_without_panic() {
         let f = tempfile::NamedTempFile::new().unwrap();
@@ -296,7 +296,7 @@ mod tests {
         assert!(read_meta(f.path()).is_err());
     }
 
-    /// Масив у масиві 20 рівнів завглибшки: Err, не переповнення стека (спека §7).
+    /// Масив у масиві 20 рівнів завглибшки: Err, не переповнення стека.
     #[test]
     fn rejects_deeply_nested_arrays_without_stack_overflow() {
         let f = tempfile::NamedTempFile::new().unwrap();

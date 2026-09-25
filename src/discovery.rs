@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 pub type SharedCluster = Arc<RwLock<Cluster>>;
 
 const SERVICE: &str = "_llmrt._tcp.local.";
-/// Скільки пропущених poll-ів до dead (§3).
+/// Скільки пропущених poll-ів до dead.
 const MAX_MISSES: u32 = 3;
-/// Таймаут запиту `/state` (§3).
+/// Таймаут запиту `/state`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Не частіше одного warning про proto на вузол за хвилину (§7).
+/// Не частіше одного warning про proto на вузол за хвилину.
 const PROTO_WARN_EVERY: Duration = Duration::from_secs(60);
 
-/// Живий вузол опитуємо раз на 3 с, мертвий — раз на 10 с (§3).
+/// Живий вузол опитуємо раз на 3 с, мертвий — раз на 10 с.
 pub fn poll_interval(alive: bool) -> Duration {
     if alive {
         Duration::from_secs(3)
@@ -45,7 +45,7 @@ impl Discovery {
         }
     }
 
-    /// Вузол відповів: оновити стан за `node_id`, `addr` — та адреса, що реально відповіла (§4).
+    /// Вузол відповів: оновити стан за `node_id`, `addr` — та адреса, що реально відповіла.
     pub fn ingest(cluster: &SharedCluster, st: NodeState, addr_used: &str) {
         let mut st = st;
         st.addr = addr_used.to_string();
@@ -158,7 +158,7 @@ impl Discovery {
                         if id == me {
                             continue;
                         }
-                        // IPv6 link-local ігноруємо (§4). Loopback анонсує enable_addr_auto,
+                        // IPv6 link-local ігноруємо. Loopback анонсує enable_addr_auto,
                         // але для чужого вузла 127.0.0.1 веде на нас самих — відкидаємо.
                         // Наслідок: сусіда на хості без жодної не-loopback адреси через mDNS
                         // не дістати — його треба задати явно в `peers = [...]`, бо seed-адреси
@@ -304,7 +304,7 @@ impl Discovery {
             }
 
             // 2. проби — паралельно: інакше кожен недоступний вузол з'їдав би свої 2 с
-            // з 3-секундного такту (§3)
+            // з 3-секундного такту
             let probes = due.iter().map(|(_, addrs)| probe_addrs(&http, addrs));
             let results = futures_util::future::join_all(probes).await;
 
@@ -326,7 +326,7 @@ impl Discovery {
 }
 
 /// Паралельно GET `/state` на всі адреси; перемагає та, що **відповіла першою** з валідним
-/// `NodeState` (§4 addr). Решта проб скасовуються, тож швидка адреса не чекає на таймаут повільної.
+/// `NodeState`. Решта проб скасовуються, тож швидка адреса не чекає на таймаут повільної.
 pub async fn probe_addrs(http: &reqwest::Client, addrs: &[String]) -> Option<(String, NodeState)> {
     let mut futs: FuturesUnordered<_> = addrs
         .iter()

@@ -1,4 +1,4 @@
-//! Per-request JSONL log (`requests.jsonl`) + warning про тихий swap (§5).
+//! Per-request JSONL log (`requests.jsonl`) + warning про тихий swap.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ pub struct Record {
 
 pub struct ReqLog {
     file: Mutex<std::fs::File>,
-    /// Перший виміряний predicted_per_second на (node, model) — база для warning (§5).
+    /// Перший виміряний predicted_per_second на (node, model) — база для warning.
     baseline: Mutex<HashMap<(String, String), f64>>,
 }
 

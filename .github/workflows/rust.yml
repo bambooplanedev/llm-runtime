@@ -22,6 +22,15 @@ jobs:
       # Без аргументів читає rust-toolchain.toml разом із components.
       - run: rustup toolchain install
       - run: cargo fmt --check
+      # Публічний репозиторій: у коді не лишаємо посилань на приватні нотатки дизайну.
+      # .github/ не скануємо — тут лежить сам regex.
+      - name: No references to private docs
+        run: |
+          set +e
+          out=$(grep -rnE '§|\bspec [A-Z0-9]|спек[аиуіо]|checks\.md|\bF[1-9]\b[:)]|флейка A|fn \w*_spec_\w*' src tests docs README.md)
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ] || { echo "$out"; exit 1; }
 
   check:
     strategy:

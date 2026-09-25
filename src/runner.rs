@@ -18,13 +18,13 @@ struct Slot {
     last_used: Instant,
     /// Коли модель стала `Failed`; фоновий цикл повертає її в `Available` після cooldown.
     failed_at: Option<Instant>,
-    /// Наступна спроба перезапуску pinned-моделі; `None` — можна пробувати вже зараз (spec 2.6).
+    /// Наступна спроба перезапуску pinned-моделі; `None` — можна пробувати вже зараз.
     pin_retry_at: Option<Instant>,
     /// Останній результат pin-спроби — щоб не спамити лог однаковим попередженням щотакту.
     pin_last: Option<&'static str>,
     /// Чи вже залоговано «changed on disk, running old file»: раз на зміну, не щоперескан.
     stale_logged: bool,
-    /// Коли слот став `Loaded`; `kill()` рахує з нього, чи була робота стабільною (B1 §3).
+    /// Коли слот став `Loaded`; `kill()` рахує з нього, чи була робота стабільною.
     loaded_since: Option<Instant>,
 }
 
@@ -43,7 +43,7 @@ impl Slot {
     }
 }
 
-/// Процес є або ще завершується: такий слот перескан не замінює і не видаляє (spec 2.7).
+/// Процес є або ще завершується: такий слот перескан не замінює і не видаляє.
 fn busy(st: ModelState) -> bool {
     matches!(
         st,
@@ -51,13 +51,13 @@ fn busy(st: ModelState) -> bool {
     )
 }
 
-/// Перескан теки (spec 2.7); під `LLMRT_FAST_TICK` — раз на секунду.
+/// Перескан теки; під `LLMRT_FAST_TICK` — раз на секунду.
 pub const RESCAN_EVERY: Duration = Duration::from_secs(30);
 
-/// Повтор завантаження моделі, що впала, — не частіше (spec 2.2). Раз на хвилину — не цикл OOM.
+/// Повтор завантаження моделі, що впала, — не частіше. Раз на хвилину — не цикл OOM.
 pub const FAILED_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Pinned-модель, що впала після стабільної роботи, прогрівається знову через стільки (B1 §3).
+/// Pinned-модель, що впала після стабільної роботи, прогрівається знову через стільки.
 pub const PIN_QUICK_RETRY: Duration = Duration::from_secs(5);
 /// «Стабільна робота»: стільки в `Loaded`, щоб крах не вважався циклом «завантажилась → впала».
 pub const PIN_STABLE: Duration = Duration::from_secs(300);
@@ -82,10 +82,10 @@ pub fn pin_retry_delay(next: ModelState, loaded_for: Option<Duration>, p: PinRet
     }
 }
 
-/// F1: скільки чекати на CUDA-пробу (`--list-devices`), перш ніж уважати драйвер завислим.
+/// Скільки чекати на CUDA-пробу (`--list-devices`), перш ніж уважати драйвер завислим.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Чи зупиняти модель за простоєм (spec 2.4). Чиста: викликається під тим самим lock-ом,
+/// Чи зупиняти модель за простоєм. Чиста: викликається під тим самим lock-ом,
 /// під яким слот переходить у `Draining` і віддає процес.
 pub fn should_idle_stop(
     e: &ModelEntry,
@@ -117,11 +117,11 @@ struct Inner {
     device: String,
     cfg: Config,
     failed_cooldown: Duration,
-    /// Затримки повтору pinned-моделі після смерті дитини (B1 §3).
+    /// Затримки повтору pinned-моделі після смерті дитини.
     pin_retry: PinRetry,
-    /// F1: таймаут CUDA-проби; `PROBE_TIMEOUT`, під `LLMRT_FAST_TICK` — 1 s, як `failed_cooldown`.
+    /// Таймаут CUDA-проби; `PROBE_TIMEOUT`, під `LLMRT_FAST_TICK` — 1 s, як `failed_cooldown`.
     probe_timeout: Duration,
-    /// `true` once `shutdown()` started (§6): нових дітей більше не запускаємо, навіть pinned.
+    /// `true` once `shutdown()` started: нових дітей більше не запускаємо, навіть pinned.
     shutting_down: bool,
 }
 
@@ -134,16 +134,16 @@ pub enum LoadOutcome {
     AlreadyLoadedOrLoading,
     NoMemory,
     Unknown,
-    /// Модель нещодавно впала; повтор — після `FAILED_COOLDOWN` (spec 2.2).
+    /// Модель нещодавно впала; повтор — після `FAILED_COOLDOWN`.
     CoolingDown,
     /// Не вдалося запустити процес (порти, fork) — біда вузла, модель лишається `Available`.
     SpawnFailed,
-    /// Демон зупиняється — нових дітей не запускаємо (§6).
+    /// Демон зупиняється — нових дітей не запускаємо.
     ShuttingDown,
 }
 
 impl LoadOutcome {
-    /// Для логу pins: пишемо лише коли результат змінився (spec 2.6).
+    /// Для логу pins: пишемо лише коли результат змінився.
     pub fn as_str(self) -> &'static str {
         match self {
             LoadOutcome::Accepted => "accepted",
@@ -216,10 +216,10 @@ impl Inner {
             let s = &self.slots[id];
             (s.model.path.clone(), s.model.entry.slots)
         };
-        // -ngl is never passed: --fit is on by default (checks.md #2). -np is explicit, the default is auto.
+        // -ngl is never passed: --fit is on by default. -np is explicit, the default is auto.
         let mut cmd = self.cfg.llama_cmd();
         // llama_args go FIRST so our fixed flags win: an operator's `--host 0.0.0.0` must never
-        // be able to expose an unauthenticated child off localhost (§6).
+        // be able to expose an unauthenticated child off localhost.
         let np_set = self.llama_args.iter().any(|a| {
             a == "-np" || a == "--parallel" || a.starts_with("-np=") || a.starts_with("--parallel=")
         });
@@ -293,7 +293,7 @@ impl Inner {
         Some(delay)
     }
 
-    /// Перевірки без I/O. `Ok(())` — можна вантажити (spec 1.2: до CUDA-проби і ще раз після).
+    /// Перевірки без I/O. `Ok(())` — можна вантажити (до CUDA-проби і ще раз після).
     fn precheck(&self, id: &str) -> Result<(), LoadOutcome> {
         if self.shutting_down {
             return Err(LoadOutcome::ShuttingDown);
@@ -370,7 +370,7 @@ impl Runner {
         (v, g.free_mb())
     }
 
-    /// Злиття перескану (spec 2.7, таблиця). «Після зупинки» робить наступний скан:
+    /// Злиття перескану: що робити зі слотом, коли файл зник, змінився чи з'явився. «Після зупинки» робить наступний скан:
     /// слот уже без процесу, і спрацьовує звичайне правило.
     pub fn merge_scan(&self, models: Vec<LocalModel>, keep: &HashSet<String>) {
         let mut g = self.0.lock().unwrap();
@@ -434,7 +434,7 @@ impl Runner {
                     }
                     out
                 }
-                // Збій NFS/USB: інвентар не стирається (spec 2.7).
+                // Збій NFS/USB: інвентар не стирається.
                 Ok(Err(e)) => {
                     if !dir_down {
                         tracing::warn!(
@@ -471,7 +471,7 @@ impl Runner {
         }
     }
 
-    /// Async, бо CUDA-проба форкає процес. Дешеві перевірки — до неї (spec 1.2): проба може
+    /// Async, бо CUDA-проба форкає процес. Дешеві перевірки — до неї: проба може
     /// тривати секунди, і для моделі, що однаково не влізе, вона марна. `spawn` лишається
     /// синхронним і на воркері (див. PDEATHSIG у `spawn`).
     pub async fn load(&self, id: &str) -> LoadOutcome {
@@ -484,8 +484,8 @@ impl Runner {
                 .starts_with("CUDA")
                 .then(|| (g.cfg.clone(), g.device.clone(), g.probe_timeout))
         };
-        // §4: на CUDA reported free враховує чужі процеси; на Metal воно безглузде.
-        // F1: асинхронно, з таймаутом — завислий драйвер не має морозити pin-прохід у
+        // На CUDA reported free враховує чужі процеси; на Metal воно безглузде.
+        // Асинхронно, з таймаутом — завислий драйвер не має морозити pin-прохід у
         // `run_background`, що чекає саме на цей `.await`.
         let reported = match probe {
             Some((cfg, device, timeout)) => {
@@ -547,7 +547,7 @@ impl Runner {
         }
     }
 
-    /// Health + idle, once every 5 s (§6); tests tick faster via `LLMRT_FAST_TICK`.
+    /// Health + idle, once every 5 s; tests tick faster via `LLMRT_FAST_TICK`.
     pub async fn run_background(self) {
         let tick = Duration::from_millis(if fast_tick() { 200 } else { 5000 });
         {
@@ -561,7 +561,7 @@ impl Runner {
             .build()
             .unwrap();
         loop {
-            // Окремий прохід по ВСІХ слотах: цикл нижче бачить лише слоти з процесом (spec 2.2).
+            // Окремий прохід по ВСІХ слотах: цикл нижче бачить лише слоти з процесом.
             {
                 let mut g = self.0.lock().unwrap();
                 let cooldown = g.failed_cooldown;
@@ -575,7 +575,7 @@ impl Runner {
                     }
                 }
             }
-            // Pins: Available → load, з backoff після будь-якого не-Accepted (spec 2.6).
+            // Pins: Available → load, з backoff після будь-якого не-Accepted.
             // Тут, на async-воркері, а не в spawn_blocking — spawn дитини мусить іти з воркера.
             let due: Vec<String> = {
                 let g = self.0.lock().unwrap();
@@ -702,7 +702,7 @@ impl Runner {
                     }
                     ModelState::Loaded => {
                         // Рішення і забирання процесу — під одним lock-ом з exec_target: порт
-                        // процесу, що зараз помре, більше ніхто не отримає (spec 2.4).
+                        // процесу, що зараз помре, більше ніхто не отримає.
                         let taken = {
                             let mut g = self.0.lock().unwrap();
                             let idle = g.idle;
@@ -729,7 +729,7 @@ impl Runner {
                             let runner = self.clone();
                             let id = id.clone();
                             // Detached: дитина в D-state (завислий драйвер GPU) не має заморозити
-                            // нагляд — cooldown, pins (spec 2.3). Пам'ять лишається зайнятою
+                            // нагляд — cooldown, pins. Пам'ять лишається зайнятою
                             // (`used_mb` рахує Draining), доки wait не повернеться.
                             tokio::spawn(async move {
                                 let _ = tokio::task::spawn_blocking(move || {
@@ -766,7 +766,7 @@ impl Runner {
         let Ok(v) = r.json::<serde_json::Value>().await else {
             return;
         };
-        // checks.md #5: /props reports n_ctx per slot; n_ctx × total_slots must match -c.
+        // /props reports n_ctx per slot; n_ctx × total_slots must match -c.
         let n_ctx = v
             .pointer("/default_generation_settings/n_ctx")
             .and_then(|x| x.as_u64());
@@ -780,7 +780,7 @@ impl Runner {
         }
     }
 
-    /// macOS has no PDEATHSIG, so on boot we kill processes carrying our argv marker (§6).
+    /// macOS has no PDEATHSIG, so on boot we kill processes carrying our argv marker.
     pub fn kill_orphans(node_id: &str) {
         let marker = format!("--alias llmrt/{node_id}/");
         let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
@@ -808,7 +808,7 @@ impl Runner {
         {
             let mut g = self.0.lock().unwrap();
             // Під тим самим lock-ом, де беремо дітей: тик, що зазирне сюди хоч на мить пізніше,
-            // мусить побачити прапорець і не заспавнити нову дитину, яку ніхто вже не вб'є (§6).
+            // мусить побачити прапорець і не заспавнити нову дитину, яку ніхто вже не вб'є.
             g.shutting_down = true;
             for s in g.slots.values_mut() {
                 if let Some(p) = s.proc_.take() {
