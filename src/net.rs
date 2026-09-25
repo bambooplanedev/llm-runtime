@@ -1,5 +1,5 @@
-//! TCP-таймаути для з'єднань, які приймає gateway (B1 §2), і ті самі значення для клієнта
-//! reqwest (spec A 1.1): peer, що зник без RST, виявляється за ~25 s в обидва боки.
+//! TCP-таймаути для з'єднань, які приймає gateway, і ті самі значення для клієнта
+//! reqwest: peer, що зник без RST, виявляється за ~25 s в обидва боки.
 
 use std::time::Duration;
 
@@ -68,11 +68,15 @@ pub mod macos {
                 &mut len,
             )
         };
-        if r == 0 {
-            Ok(v)
-        } else {
-            Err(std::io::Error::last_os_error())
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        if len as usize != std::mem::size_of::<libc::c_int>() {
+            return Err(std::io::Error::other(format!(
+                "TCP_RXT_CONNDROPTIME: getsockopt returned {len} bytes"
+            )));
+        }
+        Ok(v)
     }
 }
 

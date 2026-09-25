@@ -1,4 +1,4 @@
-//! Межі SSE-подій у стрімі до клієнта (B1 §1): клієнт отримує лише цілі події, а при обриву
+//! Межі SSE-подій у стрімі до клієнта: клієнт отримує лише цілі події, а при обриву
 //! upstream — одну подію `error` у форматі самого llama.cpp.
 
 use bytes::Bytes;
@@ -85,6 +85,19 @@ mod tests {
         let mut g = EventGate::default();
         assert!(g.push(b"data: [DONE]").is_empty());
         assert_eq!(&g.finish()[..], b"data: [DONE]");
+        assert!(g.finish().is_empty());
+    }
+
+    #[test]
+    fn empty_chunk_releases_nothing_and_keeps_tail() {
+        let mut g = EventGate::default();
+        assert!(g.push(b"").is_empty());
+        assert!(g.push(b"data: a").is_empty());
+        assert!(
+            g.push(b"").is_empty(),
+            "порожній чанк не віддає притриманий хвіст"
+        );
+        assert_eq!(&g.push(b"\n\n")[..], b"data: a\n\n");
         assert!(g.finish().is_empty());
     }
 

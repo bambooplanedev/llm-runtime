@@ -167,7 +167,8 @@ revision was removed as a weight without data.
   socket sets the same keepalive and a 25 s limit on unacknowledged data (`TCP_USER_TIMEOUT` on
   Linux, `TCP_RXT_CONNDROPTIME` on macOS). A node that streams to a vanished peer drops that
   connection, which closes the child's connection and frees its slot; the node logs `stream
-  dropped by peer`.
+  dropped by peer`. The same line appears when a local client simply goes away mid-answer,
+  since local requests also reach `/exec` over loopback.
 - A non-2xx answer from the child itself comes back from `/exec` as is, marked with
   `x-llmrt-origin: child`. Gateway passes a 4xx to the client verbatim, retries a 503 on another
   pair, and turns any other 5xx into `502 "upstream failed"` with the child's message in the log.
@@ -232,11 +233,12 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
   process exits, and the model is not picked then; with a single copy that is a brief `503`.
   Pinned models never stop.
 - **Health.** While `loading`, `GET /health` every 5 s. For `loaded` children only process exit is
-  checked: llama-server answers `/health` from its HTTP thread and does not notice a hung
-  inference loop. A dead child goes back to `available` (`failed` if it died while loading), and
-  the transition is logged as a warning. Pinned models are reloaded by the background loop. After
-  a crash that follows at least 5 minutes in `loaded` the next attempt comes 5 s later; after a
-  crash while loading, a crash shortly after loading, or a failed attempt it waits `FAILED_COOLDOWN`.
+  checked: llama-server answers `/health` from its HTTP thread and does not notice a hung inference
+  loop. A dead child goes back to `available` (`failed` if it died while loading), and the
+  transition is logged as a warning with the child's exit status (e.g. `exit status: 101` or
+  `signal: 9`). Pinned models are reloaded by the background loop. After a crash that follows at
+  least 5 minutes in `loaded` the next attempt comes 5 s later; after a crash while loading, a crash
+  shortly after loading, or a failed attempt it waits `FAILED_COOLDOWN`.
 - **Rescan.** Every 30 s the daemon rescans `models_dir`. A new or changed file is used only when
   its size and mtime match on two scans in a row, so a file still being copied is not announced.
   A removed file drops its model once no process runs it; a changed file replaces the model once

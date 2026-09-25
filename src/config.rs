@@ -37,8 +37,8 @@ pub struct Config {
     pub peers: Vec<String>,
     /// None = дефолт залежить від пристрою (2048 Metal / 1024 CUDA), вирішує inventory.
     pub os_reserve_mb: Option<u64>,
-    /// None = з `--list-devices`. Задане — перекриває ліміт пристрою на будь-якому пристрої
-    /// (spec 2.5); на CPU-збірці (0 MiB) без нього fallback бере всю фізичну RAM.
+    /// None = з `--list-devices`. Задане — перекриває ліміт пристрою на будь-якому пристрої;
+    /// на CPU-збірці (0 MiB) без нього fallback бере всю фізичну RAM.
     pub mem_limit_mb: Option<u64>,
     pub load_wait_secs: u64,
     pub idle_timeout_secs: u64,
