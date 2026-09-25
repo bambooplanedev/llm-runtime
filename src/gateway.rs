@@ -10,6 +10,7 @@ use crate::discovery::Discovery;
 use crate::planner::{self, NoPick, Pair, Pick, TIER_NAMES};
 use crate::reqlog::{Record, ReqLog};
 use crate::runner::{ExecTarget, LoadOutcome, Runner};
+use crate::sse::{self, EventGate};
 use crate::state::{now_secs, Cluster, Hw, ModelState, NodeState, NodeView, PROTO};
 use axum::{
     body::Body,
@@ -498,6 +499,11 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             .get(&pick.pair.node_id)
             .and_then(|v| v.state.models.iter().find(|m| m.id == pick.pair.model_id))
             .and_then(|m| m.active_params_b);
+        // Ім'я виконавця — для події `upstream_lost` (B1 §1); `cluster_with_self` містить і нас.
+        let exec_name = cluster
+            .get(&pick.pair.node_id)
+            .map(|v| v.state.name.clone())
+            .unwrap_or_else(|| pick.pair.node_id.clone());
         drop(cluster);
 
         if pick.cold {
@@ -601,7 +607,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
         // usage/timings. TTFT — перший байт; рядок логу — у `Finish::drop`.
         let ct = up.headers().get(header::CONTENT_TYPE).cloned();
         rec.status = 200;
-        let mut fin = Finish {
+        let fin = Finish {
             rec,
             log: gw.log.clone(),
             started,
@@ -612,16 +618,41 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             got_first: false,
             buf: Vec::new(),
         };
-        let stream = up.bytes_stream().map(move |chunk| {
-            match &chunk {
-                Ok(b) => fin.on_chunk(b),
-                Err(e) => {
-                    tracing::warn!("stream from {} broke: {e}", fin.rec.node_id);
-                    fin.rec.error = Some("upstream_lost".into());
-                    fin.rec.status = 502;
+        // Клієнту — лише цілі SSE-події; обрив upstream — подія `upstream_lost` і чисте закриття
+        // (B1 §1). `Err` в axum не годиться: hyper обірвав би з'єднання без flush, і подія
+        // загубилась би. Non-stream — як раніше: тіло обривається.
+        let state = (up.bytes_stream(), fin, EventGate::default(), exec_name);
+        let stream = futures_util::stream::unfold(Some(state), |st| async move {
+            let (mut s, mut fin, mut gate, name) = st?;
+            loop {
+                match s.next().await {
+                    Some(Ok(b)) => {
+                        fin.on_chunk(&b);
+                        let out = if fin.streaming { gate.push(&b) } else { b };
+                        if !out.is_empty() {
+                            return Some((
+                                Ok::<Bytes, std::io::Error>(out),
+                                Some((s, fin, gate, name)),
+                            ));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!("stream from {} broke: {e}", fin.rec.node_id);
+                        fin.rec.error = Some("upstream_lost".into());
+                        fin.rec.status = 502;
+                        let item = if fin.streaming {
+                            Ok(sse::error_event(&name))
+                        } else {
+                            Err(std::io::Error::other(e))
+                        };
+                        return Some((item, None));
+                    }
+                    None => {
+                        let rest = gate.finish();
+                        return (!rest.is_empty()).then_some((Ok(rest), None));
+                    }
                 }
             }
-            chunk.map_err(std::io::Error::other)
         });
         let mut resp = Response::new(Body::from_stream(stream));
         if let Some(ct) = ct {

@@ -217,6 +217,72 @@ fn chat(port: u16, model: &str, stream: bool) -> (u16, String) {
     (r.status().as_u16(), r.text().unwrap())
 }
 
+/// Стрімовий запит; тіло — текстом, або помилка транспорту (обрив chunked) — рядком.
+fn chat_raw(port: u16, model: &str) -> (u16, Result<String, String>) {
+    let c = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let r = c
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": model, "stream": true, "messages": [{"role":"user","content":"hi"}]}))
+        .send()
+        .unwrap();
+    (r.status().as_u16(), r.text().map_err(|e| e.to_string()))
+}
+
+/// Непорожні SSE-події тіла (без роздільника `\n\n`).
+fn sse_events(body: &str) -> Vec<&str> {
+    body.split("\n\n")
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+/// B1 §1: `content` цілих подій, потім рівно одна `upstream_lost` з іменем виконавця, без `[DONE]`;
+/// кожна подія — валідний JSON (жодної половинки).
+fn assert_upstream_lost(body: &str, node_name: &str, content: usize) {
+    let ev = sse_events(body);
+    assert_eq!(ev.len(), content + 1, "{body}");
+    let mut last = serde_json::Value::Null;
+    for e in &ev {
+        let p = e
+            .strip_prefix("data: ")
+            .unwrap_or_else(|| panic!("not a data event: {e:?}"));
+        last = serde_json::from_str(p).unwrap_or_else(|err| panic!("broken event {p:?}: {err}"));
+    }
+    assert_eq!(last["error"]["type"], "upstream_lost", "{body}");
+    assert_eq!(last["error"]["code"], 502, "{body}");
+    assert!(
+        last["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(node_name),
+        "{body}"
+    );
+    assert!(!body.contains("[DONE]"), "{body}");
+}
+
+/// `requests.jsonl` пише `Drop` — може відстати від EOF клієнта, тож опитуємо до 10 s.
+fn wait_log(dir: &std::path::Path, pred: impl Fn(&[serde_json::Value]) -> bool, what: &str) {
+    let t = Instant::now();
+    loop {
+        let recs: Vec<serde_json::Value> = std::fs::read_to_string(dir.join("data/requests.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if pred(&recs) {
+            return;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "timeout waiting for {what}: {recs:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 fn two_nodes_route_by_tier_and_survive_peer_death() {
     let _s = serial();
@@ -757,4 +823,85 @@ fn cli_help_and_version_exit_zero() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("--config"));
+}
+
+/// B1 §1: дитина вмирає посеред стріму — і локально, і на сусіді клієнт дочитує тіло без
+/// помилки транспорту, а остання подія — `upstream_lost` з іменем виконавця.
+#[test]
+fn stream_break_ends_with_upstream_lost_event_locally_and_via_peer() {
+    let _s = serial();
+    let die = Opts {
+        envs: &[("FAKE_DIE_MID_STREAM", "1")],
+        ..Default::default()
+    };
+    let a = spawn_with(7781, "7784-7787", &[7782], &[("tiny-0.2b.gguf", 2)], die);
+    let _b = spawn_with(
+        7782,
+        "7788-7791",
+        &[7781],
+        &[("mid-5b.gguf", 50)],
+        Opts {
+            envs: &[("FAKE_DIE_MID_STREAM", "1")],
+            ..Default::default()
+        },
+    );
+    wait_for(
+        a.port,
+        |v| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "mid-5b")
+        },
+        "/v1/models",
+        "B visible on A",
+    );
+
+    let (code, body) = chat_raw(a.port, "small");
+    assert_eq!(code, 200);
+    let body = body.expect("client must read the body without a transport error");
+    assert_upstream_lost(&body, "node7781", 2);
+
+    let (code, body) = chat_raw(a.port, "medium");
+    assert_eq!(code, 200);
+    let body = body.expect("client must read the body without a transport error");
+    assert_upstream_lost(&body, "node7782", 2);
+
+    wait_log(
+        a.dir.path(),
+        |r| {
+            r.iter()
+                .filter(|x| x["error"] == "upstream_lost" && x["status"] == 502)
+                .count()
+                >= 2
+        },
+        "two upstream_lost records",
+    );
+}
+
+/// B1 §1: обрив посеред рядка — клієнт не бачить половини події, лише цілі й нашу `error`.
+#[test]
+fn stream_break_mid_line_sends_only_whole_events() {
+    let _s = serial();
+    let a = spawn_with(
+        7796,
+        "7804-7807",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            envs: &[("FAKE_DIE_MID_LINE", "1")],
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let (code, body) = chat_raw(a.port, "small");
+    assert_eq!(code, 200);
+    let body = body.expect("client must read the body without a transport error");
+    // Не рядковий пошук: без `preserve_order` serde_json сортує поля абетково, тож ціла подія
+    // теж містить підрядок `[{"del` (з "delta") — half-фрагмент не відрізнити так від цілої
+    // події. Натомість `assert_upstream_lost` вже перевіряє і точну кількість подій (жодної
+    // зайвої — половинка або роздулась би лічильник, або зламала б парсинг JSON), і що кожна —
+    // валідний JSON, тобто половинки нема.
+    assert_upstream_lost(&body, "node7796", 2);
 }

@@ -10,6 +10,7 @@
 //! - `FAKE_TOKENS` (5)      — stream chunk count, 50 ms apart.
 //! - `FAKE_PREFILL_MS` (0)  — pause before the first chunk (prefill).
 //! - `FAKE_DIE_MID_STREAM=1`— exit(4) after 2 chunks.
+//! - `FAKE_DIE_MID_LINE=1`  — stream 2 whole events, then half of a third one, then exit(4).
 //! - `FAKE_MODEL_JSON`      — path to write `{"alias":..,"model":..,"port":..,"pid":..}` on start.
 //! - `FAKE_MEM_MB` (16384)  — device memory reported by `--list-devices`.
 //! - `FAKE_LIST_DEVICES_LOG` — append a millisecond timestamp line to this file on every `--list-devices`.
@@ -40,6 +41,7 @@ struct App {
     load_ms: u64,
     tokens: u32,
     die_mid: bool,
+    die_mid_line: bool,
     ctx: u64,
     slots: u64,
     prefill_ms: u64,
@@ -120,6 +122,7 @@ async fn main() {
         load_ms: env("FAKE_LOAD_MS", 300),
         tokens: env("FAKE_TOKENS", 5) as u32,
         die_mid: std::env::var("FAKE_DIE_MID_STREAM").is_ok(),
+        die_mid_line: std::env::var("FAKE_DIE_MID_LINE").is_ok(),
         ctx,
         slots,
         prefill_ms: env("FAKE_PREFILL_MS", 0),
@@ -203,6 +206,34 @@ async fn chat(
             "choices":[{"index":0,"message":{"role":"assistant","content":"hello from fake"},"finish_reason":"stop"}],
             "usage":usage,"timings":timings}))
         .into_response();
+    }
+    if a.die_mid_line {
+        // Дві цілі події, потім пів третьої — і смерть: обрив посеред рядка SSE.
+        let alias = a.alias.clone();
+        let s = stream::unfold(0u32, move |i| {
+            let alias = alias.clone();
+            async move {
+                // Спершу пауза: попередній шматок встигає піти клієнту до exit.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let text = match i {
+                    0 | 1 => {
+                        let c = serde_json::json!({"id":"chatcmpl-fake","object":"chat.completion.chunk","model":alias,
+                            "choices":[{"index":0,"delta":{"content":format!("tok{i} ")},"finish_reason":null}]});
+                        format!("data: {c}\n\n")
+                    }
+                    2 => "data: {\"choices\":[{\"del".to_string(),
+                    _ => std::process::exit(4),
+                };
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(text)),
+                    i + 1,
+                ))
+            }
+        });
+        return axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from_stream(s))
+            .unwrap();
     }
     let n = a.tokens;
     let alias = a.alias.clone();
