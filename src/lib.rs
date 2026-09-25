@@ -6,4 +6,5 @@ pub mod inventory;
 pub mod planner;
 pub mod reqlog;
 pub mod runner;
+pub mod sse;
 pub mod state;
