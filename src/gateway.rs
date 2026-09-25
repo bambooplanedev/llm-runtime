@@ -113,8 +113,29 @@ struct ExecReq {
     body: serde_json::Value,
 }
 
+/// Лог, коли тіло `/exec` дропнуто до кінця upstream (B1 §2): peer зник або відпав клієнт.
+/// Це мітка часу, від якої llama-server звільняє слот (він бачить закрите з'єднання ≤ 1 s).
+struct ExecEnd {
+    model: String,
+    started: Instant,
+    done: bool,
+}
+
+impl Drop for ExecEnd {
+    fn drop(&mut self) {
+        if !self.done {
+            tracing::info!(
+                "exec {}: stream dropped by peer after {:?}",
+                self.model,
+                self.started.elapsed()
+            );
+        }
+    }
+}
+
 /// §5: без `pick` — прямо на локальний дочірній процес; inflight тримає guard у тілі відповіді.
 async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
+    let started = Instant::now();
     let (port, guard) = match gw.runner.exec_target(&r.model) {
         ExecTarget::Ready { port, guard } => (port, guard),
         ExecTarget::NotLoaded => {
@@ -122,6 +143,8 @@ async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
         }
         ExecTarget::Unknown => return StatusCode::NOT_FOUND.into_response(),
     };
+    // До дитини — лише тіло, жодних заголовків клієнта. Зокрема `X-Conversation-Id` (resumable
+    // streams llama.cpp) вимкнув би скасування генерації при розриві з'єднання (B1 §2).
     let up = gw
         .http
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
@@ -153,11 +176,28 @@ async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
         }
     };
     let ct = up.headers().get(header::CONTENT_TYPE).cloned();
-    // Guard переїжджає в стрім тіла: живе, поки клієнт читає, і падає разом із тілом (§6).
-    let stream = up.bytes_stream().map(move |c| {
-        let _keep = &guard;
-        c.map_err(std::io::Error::other)
-    });
+    // Guard і `ExecEnd` живуть у стані потоку: падають разом із тілом (§6). EOF чи обрив
+    // дитини — не «peer відпав», тож `done = true` і рядка логу немає.
+    let end = ExecEnd {
+        model: r.model.clone(),
+        started,
+        done: false,
+    };
+    let stream =
+        futures_util::stream::unfold(Some((up.bytes_stream(), guard, end)), |st| async move {
+            let (mut s, guard, mut end) = st?;
+            match s.next().await {
+                Some(Ok(b)) => Some((Ok::<Bytes, std::io::Error>(b), Some((s, guard, end)))),
+                Some(Err(e)) => {
+                    end.done = true;
+                    Some((Err(std::io::Error::other(e)), None))
+                }
+                None => {
+                    end.done = true;
+                    None
+                }
+            }
+        });
     let mut resp = Response::new(Body::from_stream(stream));
     if let Some(ct) = ct {
         resp.headers_mut().insert(header::CONTENT_TYPE, ct);

@@ -80,6 +80,8 @@ struct Opts<'a> {
     load_wait_secs: u64,
     extra_toml: &'a str,
     envs: &'a [(&'a str, &'a str)],
+    /// Куди писати stdout демона (його логи); `None` — як `logs()`.
+    log_file: Option<&'a std::path::Path>,
 }
 
 impl Default for Opts<'_> {
@@ -88,6 +90,7 @@ impl Default for Opts<'_> {
             load_wait_secs: 10,
             extra_toml: "",
             envs: &[],
+            log_file: None,
         }
     }
 }
@@ -140,7 +143,10 @@ llama_args = ["-c", "1024"]
         .arg(dir.path().join("llmrt.toml"))
         .env("LLMRT_FAST_TICK", "1")
         .envs(o.envs.iter().copied())
-        .stdout(logs())
+        .stdout(match o.log_file {
+            Some(p) => Stdio::from(std::fs::File::create(p).unwrap()),
+            None => logs(),
+        })
         .stderr(logs())
         .spawn()
         .unwrap();
@@ -904,4 +910,66 @@ fn stream_break_mid_line_sends_only_whole_events() {
     // зайвої — половинка або роздулась би лічильник, або зламала б парсинг JSON), і що кожна —
     // валідний JSON, тобто половинки нема.
     assert_upstream_lost(&body, "node7796", 2);
+}
+
+/// B1 §2: тіло `/exec` дропнуто посеред генерації (клієнт відпав) → inflight 0 задовго до кінця
+/// стріму, а в лозі — «stream dropped by peer»: мітка часу для приймання на справжній мережі.
+#[test]
+fn exec_stream_dropped_mid_generation_is_logged_and_frees_inflight() {
+    use std::io::Read;
+    let _s = serial();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let a = spawn_with(
+        7797,
+        "7808-7811",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            // 200 чанків × 50 ms = 10 s генерації.
+            envs: &[("FAKE_TOKENS", "200")],
+            log_file: Some(log.path()),
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let c = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let mut r = c
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", a.port))
+        .json(&serde_json::json!({"model":"small","stream":true,"messages":[]}))
+        .send()
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let mut buf = [0u8; 256];
+    assert!(r.read(&mut buf).unwrap() > 0, "first bytes of the stream");
+    wait_for(
+        a.port,
+        |v| v["models"][0]["inflight"] == 1,
+        "/state",
+        "inflight 1 while streaming",
+    );
+    let t = Instant::now();
+    drop(r);
+    wait_for(
+        a.port,
+        |v| v["models"][0]["inflight"] == 0,
+        "/state",
+        "inflight 0 after the client dropped",
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "inflight must not wait for the 10 s generation to end: {:?}",
+        t.elapsed()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(log.path()).unwrap_or_default();
+        if text.contains("stream dropped by peer") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no drop log line:\n{text}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
