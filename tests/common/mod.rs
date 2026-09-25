@@ -1,6 +1,7 @@
 //! Спільне для тестових бінарників, що займають фіксовані порти.
 
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
 
@@ -21,7 +22,11 @@ pub fn machine_port_lock() {
         let fd = f.as_raw_fd();
         // SAFETY: `fd` живий, поки живий `f`, а `f` лежить у static до кінця процесу.
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            eprintln!(
+            // Пряме письмо у stderr, а не `eprintln!`: libtest перехоплює print!/eprint! і
+            // ховає їх для тесту, що зрештою пройшов, — тоді очікування виглядало б як завислий
+            // процес. Прямий запис у `io::stderr()` обходить цей перехоплювач.
+            let _ = writeln!(
+                std::io::stderr(),
                 "waiting for another llmrt test process (lock {})",
                 path.display()
             );
