@@ -329,11 +329,25 @@ fn two_nodes_route_by_tier_and_survive_peer_death() {
         text.trim_end().ends_with("data: [DONE]"),
         "normal stream must still end with [DONE]: {text}"
     );
+    // Клієнт бачить у `model` id моделі, а не внутрішній маркер дитини. Порівняння
+    // точне: старий alias `llmrt/<node_id>/tiny-0.2b` містить `tiny-0.2b` як підрядок.
+    for e in sse_events(&text) {
+        let Some(p) = e.strip_prefix("data: ") else {
+            continue;
+        };
+        if p == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(p).unwrap();
+        assert_eq!(v["model"], "tiny-0.2b", "{e}");
+    }
 
     // 3. medium через A → на B. Модель B стала loaded, inflight повернувся в 0
     let (code, text) = chat(a.port, "medium", false);
     assert_eq!(code, 200, "{text}");
     assert!(text.contains("hello from fake"), "{text}");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["model"], "mid-5b", "{text}");
     let st = wait_for(
         b.port,
         |v| v["models"][0]["state"] == "loaded" && v["models"][0]["inflight"] == 0,
@@ -395,7 +409,16 @@ fn load_409_when_memory_full_and_orphan_with_other_node_id_untouched() {
     // Сирота з чужим node_id: фейк запускаємо вручну, daemon не має його вбити.
     let mut orphan = Proc(
         Command::new(env!("CARGO_BIN_EXE_fake-llama-server"))
-            .args(["-m", "x", "--port", "7799", "--alias", "llmrt/other-node/x"])
+            .args([
+                "-m",
+                "x",
+                "--port",
+                "7799",
+                "--alias",
+                "x",
+                "--tags",
+                "llmrt/other-node",
+            ])
             .stdout(logs())
             .stderr(logs())
             .spawn()
@@ -484,37 +507,51 @@ llama_args = ["-c", "512"]
         .unwrap();
     assert_eq!(r.status().as_u16(), 409, "exec on not-loaded model");
 
-    // Позитивний контроль kill_orphans: сирота з НАШИМ node_id мусить загинути
-    // на старті. Демона зупиняємо (він забирає власних дітей), ghost лишається
-    // безхазяйним, і перезапуск з того самого data_dir — з тим самим node_id —
-    // має його прибрати.
+    // Позитивний контроль kill_orphans: сироти з НАШИМ node_id мусять загинути на
+    // старті — і з маркером `--tags`, і зі старим маркером у `--alias`, який ставили
+    // демони протоколу 1. Демона зупиняємо (він забирає власних дітей), ghost-и
+    // лишаються безхазяйними, і перезапуск з того самого data_dir — з тим самим
+    // node_id — має їх прибрати.
     let id = std::fs::read_to_string(node.dir.path().join("data/node_id")).unwrap();
-    let mut ghost = Proc(
-        Command::new(env!("CARGO_BIN_EXE_fake-llama-server"))
-            .args([
-                "-m",
-                "x",
-                "--port",
-                "7798",
-                "--alias",
-                &format!("llmrt/{}/ghost", id.trim()),
-            ])
-            .stdout(logs())
-            .stderr(logs())
-            .spawn()
-            .unwrap(),
-    );
+    let id = id.trim();
+    let ghost_proc = |port: &str, extra: &[String]| {
+        Proc(
+            Command::new(env!("CARGO_BIN_EXE_fake-llama-server"))
+                .args(["-m", "x", "--port", port])
+                .args(extra)
+                .stdout(logs())
+                .stderr(logs())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut ghosts = [
+        ghost_proc(
+            "7798",
+            &[
+                "--alias".into(),
+                "ghost".into(),
+                "--tags".into(),
+                format!("llmrt/{id}"),
+            ],
+        ),
+        ghost_proc("7795", &["--alias".into(), format!("llmrt/{id}/ghost-old")]),
+    ];
     std::thread::sleep(Duration::from_millis(300));
-    assert!(ghost.0.try_wait().unwrap().is_none(), "ghost must be up");
+    for g in &mut ghosts {
+        assert!(g.0.try_wait().unwrap().is_none(), "ghost must be up");
+    }
 
     let Node { _proc, port, dir } = node;
     drop(_proc);
-    // Зупинка демона забирає лише його власних дітей — ghost їй не належить.
-    // Інакше «загинув» нижче нічого не доводило б про kill_orphans.
-    assert!(
-        ghost.0.try_wait().unwrap().is_none(),
-        "ghost must outlive the daemon it is not a child of"
-    );
+    // Зупинка демона забирає лише його власних дітей — ghost-и їй не належать.
+    // Інакше «загинули» нижче нічого не доводило б про kill_orphans.
+    for g in &mut ghosts {
+        assert!(
+            g.0.try_wait().unwrap().is_none(),
+            "ghost must outlive the daemon it is not a child of"
+        );
+    }
     let node = Node {
         _proc: Proc(
             Command::new(env!("CARGO_BIN_EXE_llmrt"))
@@ -542,12 +579,14 @@ llama_args = ["-c", "512"]
         "node up again",
     );
     let t = Instant::now();
-    while ghost.0.try_wait().unwrap().is_none() {
-        assert!(
-            t.elapsed() < Duration::from_secs(3),
-            "orphan with our node_id must be killed on boot"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+    for g in &mut ghosts {
+        while g.0.try_wait().unwrap().is_none() {
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "orphan with our node_id must be killed on boot"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     assert!(
