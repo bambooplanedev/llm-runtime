@@ -9,6 +9,8 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod common;
+
 /// Демони тримають дітей, а на macOS немає PDEATHSIG: спершу SIGTERM, щоб
 /// `llmrt` встиг убити свої `llama-server`, і лише потім SIGKILL. Терпіння мусить
 /// бути СТРОГО більшим за `SHUTDOWN_GRACE` (5 s) у main.rs — інакше SIGKILL
@@ -44,6 +46,7 @@ struct Node {
 /// Тести ділять порти й процесорний час; таймінгові межі міряємо без сусідів.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn serial() -> std::sync::MutexGuard<'static, ()> {
+    common::machine_port_lock();
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 

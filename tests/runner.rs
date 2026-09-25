@@ -6,11 +6,14 @@ use llmrt::state::{Hw, ModelEntry, ModelState};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+mod common;
+
 fn fake() -> String {
     env!("CARGO_BIN_EXE_fake-llama-server").to_string()
 }
 
 fn cfg() -> Config {
+    common::machine_port_lock();
     // Один раз на процес: одночасні setenv/getenv з різних потоків тестів — UB у libc.
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
