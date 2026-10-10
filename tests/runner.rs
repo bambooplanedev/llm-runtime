@@ -6,12 +6,29 @@ use llmrt::state::{Hw, ModelEntry, ModelState};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+mod common;
+
 fn fake() -> String {
     env!("CARGO_BIN_EXE_fake-llama-server").to_string()
 }
 
 fn cfg() -> Config {
-    std::env::set_var("LLMRT_FAST_TICK", "1");
+    common::machine_port_lock();
+    // Один раз на процес: одночасні setenv/getenv з різних потоків тестів — UB у libc.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        std::env::set_var("LLMRT_FAST_TICK", "1");
+        // Явний фільтр: без RUST_LOG `fmt::try_init()` з env-filter показав
+        // би лише ERROR, а при падінні потрібні warn/info runner-а
+        // (лог смерті дочірнього процесу, «cooldown over»,
+        // «idle, stopping»).
+        // `with_test_writer` пише через print!, тож libtest показує лог
+        // лише впалого тесту.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("llmrt=debug"))
+            .with_test_writer()
+            .try_init();
+    });
     let mut c = Config::load(None).unwrap();
     c.llama_server = fake();
     c.child_ports = (7600, 7603);
@@ -155,7 +172,7 @@ async fn no_memory_and_failed_load() {
     }
     assert_eq!(r.snapshot().0[0].state, ModelState::Failed);
     assert_eq!(r.snapshot().1, 10_000, "failed holds no memory");
-    // Застарілий знімок чи pin не обходять cooldown (spec 2.2)…
+    // Застарілий знімок чи pin не обходять cooldown…
     assert!(matches!(r.load("c").await, LoadOutcome::CoolingDown));
     // …а після нього (1 s під LLMRT_FAST_TICK) модель знову Available.
     for _ in 0..60 {
@@ -218,7 +235,7 @@ async fn pinned_start_on_boot_and_inflight_blocks_idle() {
     r.shutdown().await;
 }
 
-/// Порти скінчились — біда вузла, а не моделі: модель лишається Available і видимою (spec 2.2).
+/// Порти скінчились — біда вузла, а не моделі: модель лишається Available і видимою.
 #[tokio::test]
 async fn spawn_failure_keeps_model_available() {
     let mut c = cfg();
@@ -230,7 +247,7 @@ async fn spawn_failure_keeps_model_available() {
     assert_eq!(r.snapshot().1, 10_000);
 }
 
-/// CUDA-проба форкає процес — лише після дешевих перевірок (spec 1.2).
+/// CUDA-проба форкає процес — лише після дешевих перевірок.
 #[tokio::test]
 async fn cuda_probe_runs_only_after_cheap_checks() {
     let log = tempfile::NamedTempFile::new().unwrap();
@@ -259,7 +276,7 @@ async fn cuda_probe_runs_only_after_cheap_checks() {
     r.shutdown().await;
 }
 
-/// §4: reported free з `cudaMemGetInfo` уже без пам'яті ОС — `os_reserve_mb` віднімається лише
+/// Reported free з `cudaMemGetInfo` уже без пам'яті ОС — `os_reserve_mb` віднімається лише
 /// від статичного бюджету. Числа з RTX 4070 Laptop, де подвійне віднімання давало 409.
 #[tokio::test]
 async fn cuda_reported_free_is_not_reduced_by_os_reserve() {
@@ -298,7 +315,7 @@ async fn cuda_reported_free_still_caps_load() {
     r.shutdown().await;
 }
 
-/// F1: завислий CUDA-драйвер не має морозити нагляд — `load()` повертає `SpawnFailed` після
+/// Завислий CUDA-драйвер не має морозити нагляд — `load()` повертає `SpawnFailed` після
 /// `PROBE_TIMEOUT` (1 s під fast tick), а не висить, поки `--list-devices` колись відповість.
 #[tokio::test]
 async fn cuda_probe_timeout_returns_spawn_failed() {
@@ -349,9 +366,11 @@ async fn kill_child(j: &std::path::Path, r: &Runner) {
     panic!("death must be noticed");
 }
 
-/// spec 2.6 + B1 §3: pinned-дитина, вбита ззовні, повертається. Щойно завантажена — не раніше
+/// Pinned-дитина, вбита ззовні, повертається. Щойно завантажена — не раніше
 /// cooldown (цикл OOM); після стабільної роботи (fast `stable` = 3 s) — швидко. Точні паузи
-/// перевіряє `pin_retry_quick_only_after_stable_run`; тут таймінгів не міряємо (урок флейка A).
+/// перевіряє `pin_retry_quick_only_after_stable_run`; тут точних
+/// таймінгів не перевіряємо, бо під навантаженням вони
+/// ненадійні.
 #[tokio::test]
 async fn pinned_child_killed_externally_comes_back() {
     let j = tempfile::NamedTempFile::new().unwrap();
@@ -388,7 +407,7 @@ async fn pinned_child_killed_externally_comes_back() {
     r.shutdown().await;
 }
 
-/// spec 2.6: pin, що не влазить, не пробується кожен такт — backoff FAILED_COOLDOWN.
+/// Pin, що не влазить, не пробується кожен такт — backoff FAILED_COOLDOWN.
 #[tokio::test]
 async fn pinned_that_does_not_fit_backs_off() {
     let log = tempfile::NamedTempFile::new().unwrap();
@@ -435,7 +454,7 @@ async fn pinned_that_does_not_fit_backs_off() {
     bg.abort();
 }
 
-/// §6: a tick landing inside the shutdown window must not respawn a pinned model — shutdown()
+/// A tick landing inside the shutdown window must not respawn a pinned model — shutdown()
 /// never kills a child that starts after it already took the old ones (orphan, no PDEATHSIG on
 /// macOS).
 #[tokio::test]
@@ -457,7 +476,7 @@ async fn shutdown_blocks_new_spawns_even_for_pins() {
     bg.abort();
 }
 
-/// spec 2.7: правила злиття. «Процес є» = Loading/Loaded/Draining — такий слот не чіпаємо.
+/// Правила злиття. «Процес є» = Loading/Loaded/Draining — такий слот не чіпаємо.
 #[tokio::test]
 async fn merge_scan_rules() {
     let mut c = cfg();
@@ -510,7 +529,7 @@ async fn merge_scan_rules() {
     r.shutdown().await;
 }
 
-/// F2: dangerous cells of the spec 2.7 merge table that `merge_scan_rules` did not cover.
+/// Dangerous cells of the merge table that `merge_scan_rules` did not cover.
 #[tokio::test]
 async fn merge_scan_gone_but_busy_stays_and_failed_reset_on_replace() {
     // Cell: file gone from the new scan (not even in `keep`), but a process is still running
@@ -526,7 +545,7 @@ async fn merge_scan_gone_but_busy_stays_and_failed_reset_on_replace() {
     assert_eq!(
         models.iter().find(|m| m.id == "run").unwrap().state,
         ModelState::Loaded,
-        "file gone but process running → slot stays (spec 2.7)"
+        "file gone but process running → slot stays"
     );
     bg.abort();
     r.shutdown().await;
@@ -583,7 +602,7 @@ fn idle_stop_decision() {
     );
 }
 
-/// B1 §3: швидкий повтор — лише для pinned-моделі, що впала після стабільної роботи в `Loaded`.
+/// Швидкий повтор — лише для pinned-моделі, що впала після стабільної роботи в `Loaded`.
 #[test]
 fn pin_retry_quick_only_after_stable_run() {
     let p = PinRetry {
@@ -613,4 +632,47 @@ fn pin_retry_quick_only_after_stable_run() {
     );
     // Без мітки `loaded_since` — обережно, cooldown.
     assert_eq!(pin_retry_delay(ModelState::Available, None, p), p.cooldown);
+}
+
+/// Завантаження довше за idle_timeout: простій рахується від `Loaded`, інакше `/load`-прогрів
+/// вивантажується на першому ж такті після завантаження.
+#[tokio::test]
+async fn idle_counts_from_loaded_not_from_spawn() {
+    let mut c = cfg();
+    c.child_ports = (7630, 7630);
+    c.idle_timeout_secs = 2;
+    c.llama_server = format!("env FAKE_LOAD_MS=3000 {}", fake());
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    let state = |r: &Runner| r.snapshot().0[0].state;
+    // Завантаження 3 s — власний бюджет 10 s замість 5 s у wait_loaded.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state(&r) != ModelState::Loaded {
+        assert!(
+            Instant::now() < deadline,
+            "never loaded: {:?}",
+            r.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Помічено ≥ промоції; 1 s < idle 2 s з запасом у 1 s на запізнілий такт.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        state(&r),
+        ModelState::Loaded,
+        "idle must count from Loaded: load 3 s > idle 2 s"
+    );
+    // І все ж вивантажується після простою: idle 2 s + кілька тактів по 200 ms.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state(&r) != ModelState::Available {
+        assert!(
+            Instant::now() < deadline,
+            "never unloaded: {:?}",
+            r.snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    bg.abort();
+    r.shutdown().await;
 }

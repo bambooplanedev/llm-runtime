@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// `(шлях, розмір, mtime)` кожного шарду моделі: за ним перескан бачить зміну файлу (spec 2.7).
+/// `(шлях, розмір, mtime)` кожного шарду моделі: за ним перескан бачить зміну файлу.
 pub type Fingerprint = Vec<(PathBuf, u64, SystemTime)>;
 
 /// Попередній скан по файлах: `(розмір, mtime)` і заголовок або текст помилки.
-/// Він же кеш метаданих і база стабілізації (spec 2.7). Кожен скан будує нову мапу.
+/// Він же кеш метаданих і база стабілізації. Кожен скан будує нову мапу.
 pub type ScanCache = HashMap<PathBuf, ((u64, SystemTime), Result<GgufMeta, String>)>;
 
 #[derive(Default)]
@@ -45,7 +45,7 @@ pub fn model_id(file_name: &str) -> String {
     stem.to_ascii_lowercase()
 }
 
-/// -c у llama.cpp — загальний контекст на всі слоти (checks.md #5), тому np не множиться.
+/// -c у llama.cpp — загальний контекст на всі слоти, тому np не множиться.
 /// У гібридах (qwen35/qwen3next) KV є лише в кожному `full_attention_interval`-му шарі;
 /// стан рекурентних шарів фіксований і малий, його покриває запас 512 MB.
 pub fn kv_mb(meta: &GgufMeta, a: &LlamaArgs) -> u64 {
@@ -62,7 +62,7 @@ pub fn kv_mb(meta: &GgufMeta, a: &LlamaArgs) -> u64 {
     (bytes / (1024.0 * 1024.0)).ceil() as u64
 }
 
-/// §4: need = size + kv + 512.
+/// need = size + kv + 512.
 pub fn need_mb(meta: &GgufMeta, total_size: u64, a: &LlamaArgs) -> u64 {
     total_size / (1024 * 1024) + kv_mb(meta, a) + 512
 }
@@ -85,7 +85,7 @@ pub fn scan(dir: &Path, a: &LlamaArgs) -> Vec<LocalModel> {
 
 type Part = (PathBuf, GgufMeta, u64, SystemTime);
 
-/// spec 2.7. Помилка `read_dir` — `Err`: викликач лишає інвентар як є.
+/// Помилка `read_dir` — `Err`: викликач лишає інвентар як є.
 pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io::Result<ScanOut> {
     let mut out = ScanOut::default();
     let mut groups: BTreeMap<String, Vec<Part>> = BTreeMap::new();
@@ -138,7 +138,7 @@ pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io:
         // сортується першим і група «нешардований + шард» інакше подвоїла б розмір.
         let expect = parts[0].1.split_count.map_or(1, |c| c as usize);
         if parts.len() != expect {
-            // F6: split_count відсутній, а файлів кілька — це не «частина шардів», а id-колізія
+            // split_count відсутній, а файлів кілька — це не «частина шардів», а id-колізія
             // (напр. `Foo-1B.gguf` і `Foo-1B-copy.gguf` дали той самий `model_id`): назвати файли.
             let msg = if parts[0].1.split_count.is_none() && parts.len() > 1 {
                 let names = parts
@@ -154,7 +154,7 @@ pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io:
             out.keep.insert(id);
             continue;
         }
-        // read_meta пропускає шарди без метаданих, тож групу перевіряємо тут (spec 2.1).
+        // read_meta пропускає шарди без метаданих, тож групу перевіряємо тут.
         let numbered = parts
             .iter()
             .enumerate()
@@ -169,7 +169,7 @@ pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io:
         }
         let (first_path, first_meta) = (parts[0].0.clone(), parts[0].1.clone());
         let total: u64 = parts.iter().map(|x| x.1.file_size).sum();
-        // tensor-info шардів не перетинається, тож параметри, як і розмір, сумуються (§4).
+        // tensor-info шардів не перетинається, тож параметри, як і розмір, сумуються.
         let params: u64 = parts.iter().map(|x| x.1.params).sum();
         let params_b = params as f64 / 1e9;
         let active = first_meta
@@ -201,7 +201,7 @@ pub fn scan_dir(dir: &Path, a: &LlamaArgs, prev: Option<&ScanCache>) -> std::io:
 
 const GPU_PREFIXES: [&str; 5] = ["MTL", "CUDA", "Vulkan", "ROCm", "HIP"];
 
-/// Формат (checks.md #1): `  MTL0: Apple M4 (12124 MiB, 12123 MiB free)`. Перший GPU-рядок виграє;
+/// Формат: `  MTL0: Apple M4 (12124 MiB, 12123 MiB free)`. Перший GPU-рядок виграє;
 /// без GPU — перший рядок з ненульовим total (CPU-збірка).
 pub fn parse_list_devices(out: &str) -> Hw {
     let mut hw = Hw {
@@ -231,7 +231,7 @@ pub fn parse_list_devices(out: &str) -> Hw {
         let is_gpu = GPU_PREFIXES.iter().any(|p| name.starts_with(p));
         if is_gpu || (hw.mem_limit_mb == 0 && total > 0) {
             hw.device = name.trim().to_string();
-            hw.mem_limit_mb = total; // для MTL це робочий набір Metal, не RAM (§4)
+            hw.mem_limit_mb = total; // для MTL це робочий набір Metal, не RAM
             hw.cpu = rest[..open].trim().to_string();
             if is_gpu {
                 break;
@@ -274,7 +274,7 @@ pub fn total_ram_mb() -> Option<u64> {
     }
 }
 
-/// `mem_limit_mb` з конфігу перекриває `--list-devices` на будь-якому пристрої (spec 2.5).
+/// `mem_limit_mb` з конфігу перекриває `--list-devices` на будь-якому пристрої.
 /// Більший за ліміт GPU — лише warning: на CUDA перед стартом дитини реально вільна VRAM
 /// однаково обмежує завантаження (`Runner::load`).
 pub fn resolve_mem_limit(reported_mb: u64, cfg_mb: Option<u64>) -> (u64, Option<String>) {
@@ -291,7 +291,7 @@ pub fn resolve_mem_limit(reported_mb: u64, cfg_mb: Option<u64>) -> (u64, Option<
     }
 }
 
-/// §7: єдина фатальна помилка старту — llama.cpp не запускається. CPU-збірка без акселератора
+/// Єдина фатальна помилка старту — llama.cpp не запускається. CPU-збірка без акселератора
 /// рапортує 0 MiB (`BLAS: Accelerate (0 MiB, …)`), і це не привід не стартувати: ліміт тоді
 /// або з конфігу, або вся фізична RAM (os_reserve_mb лишає ОС її шматок).
 pub fn probe_hw(cfg: &Config) -> anyhow::Result<Hw> {
@@ -340,10 +340,10 @@ pub fn parse_free_mb(out: &str) -> Option<u64> {
     })
 }
 
-/// F1: `--list-devices` завис (заглухлий драйвер) — таймаут спрацював раніше, ніж процес відповів.
+/// `--list-devices` завис (заглухлий драйвер) — таймаут спрацював раніше, ніж процес відповів.
 pub struct ProbeTimedOut;
 
-/// F1: асинхронна проба вільної VRAM з таймаутом, щоб завислий CUDA-драйвер не морозив нагляд
+/// Асинхронна проба вільної VRAM з таймаутом, щоб завислий CUDA-драйвер не морозив нагляд
 /// (`Runner::load`, викликається з pin-проходу `run_background`). `kill_on_drop` прибирає процес,
 /// якщо таймаут спрацював раніше за завершення. Помилка запуску (не таймаут) — як і раніше,
 /// `None`: проба просто нічого не дала, це не біда вузла.
@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_and_need_follow_spec_formula() {
+    fn kv_and_need_follow_formula() {
         let meta = crate::gguf::GgufMeta {
             layers: 36,
             kv_heads: 8,
@@ -423,11 +423,7 @@ mod tests {
         assert_eq!(kv_mb(&meta, &a), 1152);
         assert_eq!(need_mb(&meta, 5030 * 1024 * 1024, &a), 5030 + 1152 + 512);
         let a2 = LlamaArgs { np: 2, ..a };
-        assert_eq!(
-            kv_mb(&meta, &a2),
-            1152,
-            "-c is total across slots (checks.md #5)"
-        );
+        assert_eq!(kv_mb(&meta, &a2), 1152, "-c is total across slots");
     }
 
     #[test]
@@ -478,7 +474,7 @@ mod tests {
             &["--layers", "2", "--split", "1/2"],
         );
         // Обидва файли — «другий шард»: група без метаданих мусить бути пропущена,
-        // інакше kv_mb = 0 і need_mb занижений (spec 2.1).
+        // інакше kv_mb = 0 і need_mb занижений.
         mk(
             "Bad-1B-00001-of-00002.gguf",
             &["--layers", "2", "--split", "2/2"],
@@ -522,7 +518,7 @@ mod tests {
             !got.iter().any(|m| m.entry.id == "mixed-1b"),
             "змішана група мусить бути пропущена"
         );
-        // F6: split_count == None і кілька файлів на один id — це колізія id, не «частина шардів»;
+        // split_count == None і кілька файлів на один id — це колізія id, не «частина шардів»;
         // текст попередження мусить це називати, а не «k of 1 shards present».
         let out = scan_dir(dir.path(), &a, None).unwrap();
         let mixed_warn = out
@@ -605,7 +601,7 @@ mod tests {
 
     #[test]
     fn parses_list_devices_metal() {
-        // Дослівно з checks.md #1 (llama.cpp b10826, M4 16 GB)
+        // Реальний вивід `--list-devices` (llama.cpp b10826, M4 16 GB)
         let out = "Available devices:\n  MTL0: Apple M4 (12124 MiB, 12123 MiB free)\n  BLAS: Accelerate (0 MiB, 0 MiB free)\n";
         let hw = parse_list_devices(out);
         assert_eq!(hw.device, "MTL0");
@@ -618,7 +614,7 @@ mod tests {
         assert_eq!(default_os_reserve(&parse_list_devices(cuda)), 1024);
     }
 
-    /// spec 2.7: новий чи змінений файл береться лише на другому скані з тим самим
+    /// Новий чи змінений файл береться лише на другому скані з тим самим
     /// (size, mtime); непрочитаний лишається в keep; warn-once ключ стабільний.
     #[test]
     fn rescan_waits_for_a_stable_file_and_keeps_unreadable() {

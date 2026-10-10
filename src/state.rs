@@ -81,7 +81,7 @@ mod tests {
       "free_mb": 4100, "seen": 1757600000 }"#;
 
     #[test]
-    fn round_trip_spec_example() {
+    fn round_trip_protocol_example() {
         let s: NodeState = serde_json::from_str(EXAMPLE).unwrap();
         assert_eq!(s.proto, PROTO);
         assert_eq!(s.models[0].state, ModelState::Loaded);

@@ -1,5 +1,5 @@
 //! HTTP-шар `llmrt`: peer-роути `/state`, `/load`, `/exec` і клієнтські
-//! `/v1/models`, `/v1/chat/completions` (§5–§7).
+//! `/v1/models`, `/v1/chat/completions`.
 //!
 //! Два прийоми тримають облік чесним на всіх шляхах виходу:
 //! `InflightGuard` живе всередині тіла відповіді `/exec`, а `Finish` пише
@@ -26,17 +26,17 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Таймаут службових запитів до сусіда (§3).
+/// Таймаут службових запитів до сусіда.
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
-/// `/load` на CUDA спершу запускає `--list-devices` — 2 s `PEER_TIMEOUT` замало (spec 1.2).
+/// `/load` на CUDA спершу запускає `--list-devices` — 2 s `PEER_TIMEOUT` замало.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
-/// Генерація може тривати довго; це запобіжник, а не бюджет (§5).
+/// Генерація може тривати довго; це запобіжник, а не бюджет.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
-/// Максимум два повтори `pick` (§5).
+/// Максимум два повтори `pick`.
 const MAX_RETRIES: u32 = 2;
 /// Ліміт тіла запиту: довгий промпт легко перебиває дефолтні 2 МБ axum.
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
-/// Маркер відповіді самої дитини на `/exec`: відрізняє її від власних 409/404/503 вузла (spec 1.4).
+/// Маркер відповіді самої дитини на `/exec`: відрізняє її від власних 409/404/503 вузла.
 pub const ORIGIN_HEADER: &str = "x-llmrt-origin";
 /// Тіло помилки дитини буферизується не більше цього.
 const ERR_BODY_LIMIT: usize = 64 * 1024;
@@ -59,7 +59,7 @@ pub fn router(gw: Gateway) -> Router {
         .route("/exec", post(exec))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
-        // Дефолтні 2 МБ вистачає не всякому промпту, а 413 — не той код, що бачить клієнт (§7).
+        // Дефолтні 2 МБ вистачає не всякому промпту, а 413 — не той код, що бачить клієнт.
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .fallback(|| async { err(400, "unknown route") })
         .with_state(gw)
@@ -91,7 +91,7 @@ struct LoadReq {
     model: String,
 }
 
-/// Асинхронний: `202` означає «прийнято», а не «завантажено» — чекає викликач (§5).
+/// Асинхронний: `202` означає «прийнято», а не «завантажено» — чекає викликач.
 async fn load(State(gw): State<Gateway>, Json(r): Json<LoadReq>) -> Response {
     match gw.runner.load(&r.model).await {
         LoadOutcome::Accepted | LoadOutcome::AlreadyLoadedOrLoading => {
@@ -113,7 +113,7 @@ struct ExecReq {
     body: serde_json::Value,
 }
 
-/// Лог, коли тіло `/exec` дропнуто до кінця upstream (B1 §2): peer зник або відпав клієнт.
+/// Лог, коли тіло `/exec` дропнуто до кінця upstream: peer зник або відпав клієнт.
 /// Це мітка часу, від якої llama-server звільняє слот (він бачить закрите з'єднання ≤ 1 s).
 struct ExecEnd {
     model: String,
@@ -133,7 +133,7 @@ impl Drop for ExecEnd {
     }
 }
 
-/// §5: без `pick` — прямо на локальний дочірній процес; inflight тримає guard у тілі відповіді.
+/// Без `pick` — прямо на локальний дочірній процес; inflight тримає guard у тілі відповіді.
 async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
     let started = Instant::now();
     let (port, guard) = match gw.runner.exec_target(&r.model) {
@@ -144,7 +144,7 @@ async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
         ExecTarget::Unknown => return StatusCode::NOT_FOUND.into_response(),
     };
     // До дитини — лише тіло, жодних заголовків клієнта. Зокрема `X-Conversation-Id` (resumable
-    // streams llama.cpp) вимкнув би скасування генерації при розриві з'єднання (B1 §2).
+    // streams llama.cpp) вимкнув би скасування генерації при розриві з'єднання.
     let up = gw
         .http
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
@@ -176,7 +176,7 @@ async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
         }
     };
     let ct = up.headers().get(header::CONTENT_TYPE).cloned();
-    // Guard і `ExecEnd` живуть у стані потоку: падають разом із тілом (§6). EOF чи обрив
+    // Guard і `ExecEnd` живуть у стані потоку: падають разом із тілом. EOF чи обрив
     // дитини — не «peer відпав», тож `done = true` і рядка логу немає.
     let end = ExecEnd {
         model: r.model.clone(),
@@ -237,7 +237,7 @@ async fn models(State(gw): State<Gateway>) -> Json<serde_json::Value> {
 }
 
 /// Модель підміняємо на конкретний id вузла; `usage` у стрімі llama.cpp дає
-/// лише `stream_options.include_usage` (checks.md).
+/// лише `stream_options.include_usage`.
 ///
 /// Тіло — довільний JSON від клієнта, тож жодного `Value` не індексуємо наосліп:
 /// `IndexMut` для `Value` панікує на всьому, що не об'єкт і не `null`.
@@ -357,7 +357,7 @@ pub fn no_pick_status(n: NoPick) -> (u16, &'static str) {
     }
 }
 
-/// Клієнт бачить лише 400/502/503 у форматі OpenAI (§7).
+/// Клієнт бачить лише 400/502/503 у форматі OpenAI.
 fn err(code: u16, msg: &str) -> Response {
     (
         StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -366,7 +366,7 @@ fn err(code: u16, msg: &str) -> Response {
         .into_response()
 }
 
-/// Знімок кластера + локальний вузол як рівноправний кандидат (§5).
+/// Знімок кластера + локальний вузол як рівноправний кандидат.
 /// Повертає власні дані: read-guard не переживає жодного `.await`.
 fn cluster_with_self(gw: &Gateway) -> Cluster {
     let mut c = gw.disc.cluster.read().unwrap().clone();
@@ -498,7 +498,7 @@ impl Drop for Finish {
 }
 
 /// Тіло беремо сирими байтами: `Json`-екстрактор відповів би 415/413/плейнтекст-400,
-/// а клієнт має бачити лише 400/502/503 у форматі OpenAI (§7).
+/// а клієнт має бачити лише 400/502/503 у форматі OpenAI.
 async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
     let started = Instant::now();
     let body: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
@@ -507,7 +507,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    // Рядок логу має бути й на 400 (§5), тож `rec` існує до будь-якої перевірки.
+    // Рядок логу має бути й на 400, тож `rec` існує до будь-якої перевірки.
     let mut rec = Record {
         ts: now_secs(),
         requested: requested.clone(),
@@ -539,7 +539,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             .get(&pick.pair.node_id)
             .and_then(|v| v.state.models.iter().find(|m| m.id == pick.pair.model_id))
             .and_then(|m| m.active_params_b);
-        // Ім'я виконавця — для події `upstream_lost` (B1 §1); `cluster_with_self` містить і нас.
+        // Ім'я виконавця — для події `upstream_lost`; `cluster_with_self` містить і нас.
         let exec_name = cluster
             .get(&pick.pair.node_id)
             .map(|v| v.state.name.clone())
@@ -564,7 +564,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
                             continue;
                         }
                         // Приєдналися до чужого старту, а він не встиг: пробуємо інший вузол,
-                        // щоб один повільний старт не блокував тир для всіх (spec 1.3).
+                        // щоб один повільний старт не блокував тир для всіх.
                         Loaded::Pending if pick.joined => {
                             exclude.insert(pick.pair.clone());
                             continue;
@@ -659,7 +659,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             buf: Vec::new(),
         };
         // Клієнту — лише цілі SSE-події; обрив upstream — подія `upstream_lost` і чисте закриття
-        // (B1 §1). `Err` в axum не годиться: hyper обірвав би з'єднання без flush, і подія
+        // `Err` в axum не годиться: hyper обірвав би з'єднання без flush, і подія
         // загубилась би. Non-stream — як раніше: тіло обривається.
         let state = (up.bytes_stream(), fin, EventGate::default(), exec_name);
         let stream = futures_util::stream::unfold(Some(state), |st| async move {

@@ -1,5 +1,5 @@
 //! Демон `llmrt [PATH | --config PATH]`: конфіг → node_id → probe → сироти →
-//! скан моделей → runner → discovery → лог → gateway (§1–§7).
+//! скан моделей → runner → discovery → лог → gateway.
 
 use axum::serve::ListenerExt;
 use clap::Parser;
@@ -30,10 +30,10 @@ struct Cli {
 /// Скільки чекати на з'єднання, що ще в польоті, після сигналу. Довга генерація
 /// має власний таймаут у годину (`EXEC_TIMEOUT`), тож без цієї межі SIGTERM
 /// посеред стріму не зупинив би нічого — а на macOS немає PDEATHSIG, і дочірні
-/// `llama-server` пережили б демона (§6).
+/// `llama-server` пережили б демона.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// SIGINT або SIGTERM — те й те зупиняє дітей (§6).
+/// SIGINT або SIGTERM — те й те зупиняє дітей.
 async fn stop_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = match signal(SignalKind::terminate()) {
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::load(path.as_deref())?);
     std::fs::create_dir_all(&cfg.data_dir)?;
 
-    // node_id: один раз, на диску (§4)
+    // node_id: один раз, на диску
     let id_path = cfg.data_dir.join("node_id");
     let node_id = match std::fs::read_to_string(&id_path) {
         Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // §7: llama.cpp не запускається — єдина фатальна помилка старту
+    // llama.cpp не запускається — єдина фатальна помилка старту
     let hw = inventory::probe_hw(&cfg).map_err(|e| {
         anyhow::anyhow!(
             "llama.cpp not usable (`{} --list-devices`; PATH={}): {e:#}",
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     Runner::kill_orphans(&node_id);
 
     let args = cfg.parse_llama_args();
-    // Стартовий скан дає і моделі, і кеш — з ним перескан не перечитує заголовки (spec 2.7).
+    // Стартовий скан дає і моделі, і кеш — з ним перескан не перечитує заголовки.
     let scanned = inventory::scan_dir(&cfg.models_dir, &args, None).unwrap_or_else(|e| {
         tracing::warn!("models_dir {} not readable: {e}", cfg.models_dir.display());
         inventory::ScanOut::default()
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
     let log = Arc::new(ReqLog::open(&cfg.data_dir.join("requests.jsonl"))?);
     // Без глобального таймауту: генерація триває скільки треба, і кожен виклик
     // ставить власний (`PEER_TIMEOUT`/`LOAD_TIMEOUT`/`EXEC_TIMEOUT` у gateway).
-    // Keepalive — явно (spec 1.1): дефолти reqwest 0.13.5 (15 s / 15 s / 3, на Linux ще
+    // Keepalive — явно: дефолти reqwest 0.13.5 (15 s / 15 s / 3, на Linux ще
     // TCP_USER_TIMEOUT 30 s) дають ~60 s на macOS і ~30 s на Linux до виявлення вузла, що зник
     // без RST (вимкнений Wi-Fi). Тут ~25 s на обох. Живий вузол підтверджує проби ядром навіть
     // посеред довгого prefill, тож легітимні запити не обриваються.
@@ -132,14 +132,14 @@ async fn main() -> anyhow::Result<()> {
         http,
     };
 
-    tokio::spawn(runner.clone().run_background()); // нагляд за дітьми; pinned стартують на першому такті циклу (spec 2.6)
+    tokio::spawn(runner.clone().run_background()); // нагляд за дітьми; pinned стартують на першому такті циклу
     tokio::spawn(
         runner
             .clone()
             .run_rescan(cfg.models_dir.clone(), args, scanned.cache),
     );
     tokio::spawn(disc.run());
-    // Кожне прийняте з'єднання — з keepalive і лімітом непідтверджених даних (B1 §2): інакше
+    // Кожне прийняте з'єднання — з keepalive і лімітом непідтверджених даних: інакше
     // `/exec` у зниклого peer'а тримає слот llama-server до повернення мережі.
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port))
         .await?
@@ -174,6 +174,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     };
-    runner.shutdown().await; // §6: сигнал зупиняє і дочірні llama-server
+    runner.shutdown().await; // сигнал зупиняє і дочірні llama-server
     Ok(res?)
 }

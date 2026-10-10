@@ -1,6 +1,6 @@
 //! Два справжні демони `llmrt` + фейковий `llama-server`: маршрутизація за
 //! тірами, повтор після смерті сусіда, 409 при браку пам'яті, повернення
-//! inflight після відпадання клієнта (§5, §6, §9).
+//! inflight після відпадання клієнта.
 //!
 //! Запускати послідовно: `cargo test --test integration -- --test-threads=1`
 //! (тести й самі серіалізуються через `SERIAL`, але так чистіший вивід).
@@ -8,6 +8,8 @@
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod common;
 
 /// Демони тримають дітей, а на macOS немає PDEATHSIG: спершу SIGTERM, щоб
 /// `llmrt` встиг убити свої `llama-server`, і лише потім SIGKILL. Терпіння мусить
@@ -44,6 +46,7 @@ struct Node {
 /// Тести ділять порти й процесорний час; таймінгові межі міряємо без сусідів.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn serial() -> std::sync::MutexGuard<'static, ()> {
+    common::machine_port_lock();
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -247,7 +250,7 @@ fn sse_events(body: &str) -> Vec<&str> {
         .collect()
 }
 
-/// B1 §1: `content` цілих подій, потім рівно одна `upstream_lost` з іменем виконавця, без `[DONE]`;
+/// `content` цілих подій, потім рівно одна `upstream_lost` з іменем виконавця, без `[DONE]`;
 /// кожна подія — валідний JSON (жодної половинки).
 fn assert_upstream_lost(body: &str, node_name: &str, content: usize) {
     let ev = sse_events(body);
@@ -294,7 +297,7 @@ fn wait_log(dir: &std::path::Path, pred: impl Fn(&[serde_json::Value]) -> bool, 
 #[test]
 fn two_nodes_route_by_tier_and_survive_peer_death() {
     let _s = serial();
-    // A: small модель (0.2B), B: medium (5B). Різні child_ports (§10).
+    // A: small модель (0.2B), B: medium (5B). Різні child_ports.
     let a = spawn(7711, "7720-7723", &[7712], &[("tiny-0.2b.gguf", 2)]);
     let b = spawn(7712, "7730-7733", &[7711], &[("mid-5b.gguf", 50)]);
 
@@ -555,7 +558,7 @@ llama_args = ["-c", "512"]
 #[test]
 fn client_disconnect_during_prefill_returns_inflight() {
     let _s = serial();
-    // §9: чи повертається inflight, коли клієнт відпав до першого байта.
+    // Чи повертається inflight, коли клієнт відпав до першого байта.
     // Фейк спить 3 с перед першим чанком.
     let dir = tempfile::tempdir().unwrap();
     let mdir = dir.path().join("models");
@@ -660,11 +663,11 @@ llama_args = ["-c", "512"]
         "inflight back to 0 after client drop",
     );
     // Якщо це проходить лише після ~3 с (коли фейк почав писати), hyper дропає
-    // future тільки на write — це допустимо, але має бути задокументовано (§9).
+    // future тільки на write — це допустимо, але має бути задокументовано.
     eprintln!("inflight returned after {:?}", t.elapsed());
 }
 
-/// spec 1.3: другий клієнт під час холодного старту чекає разом з першим, а не отримує 503.
+/// Другий клієнт під час холодного старту чекає разом з першим, а не отримує 503.
 /// Один вузол: з двома другий запит холодно стартував би на сусіді й тест пройшов би без виправлення.
 #[test]
 fn second_request_joins_a_cold_start_instead_of_503() {
@@ -694,8 +697,8 @@ fn second_request_joins_a_cold_start_instead_of_503() {
     assert_eq!(code, 200, "first request: {body}");
 }
 
-/// spec 1.3: запит, що приєднався до чужого старту, після load_wait_secs іде на інший вузол.
-/// Регресійний: до задачі він зелений (Loading просто пропускався), після зміни лише planner —
+/// Запит, що приєднався до чужого старту, після load_wait_secs іде на інший вузол.
+/// Регресійний: до зміни він зелений (Loading просто пропускався), після зміни лише planner —
 /// червоний (503), після зміни gateway — знову зелений.
 #[test]
 fn joined_slow_start_falls_back_to_another_node() {
@@ -754,7 +757,7 @@ fn joined_slow_start_falls_back_to_another_node() {
     );
 }
 
-/// spec 1.4: 4xx від llama.cpp — клієнту дослівно, і для stream, і без.
+/// 4xx від llama.cpp — клієнту дослівно, і для stream, і без.
 #[test]
 fn llama_cpp_4xx_reaches_the_client_verbatim() {
     let _s = serial();
@@ -786,7 +789,7 @@ fn llama_cpp_4xx_reaches_the_client_verbatim() {
     );
 }
 
-/// spec 2.7: новий GGUF з'являється без перезапуску. Файл пишемо поза текою і робимо rename,
+/// Новий GGUF з'являється без перезапуску. Файл пишемо поза текою і робимо rename,
 /// інакше скан міг би прочитати напівзаписаний файл.
 #[test]
 fn new_gguf_appears_without_restart() {
@@ -820,7 +823,7 @@ fn new_gguf_appears_without_restart() {
     );
 }
 
-/// spec 3.1: CLI на clap — `--version`/`--help` виходять з кодом 0, `--help` згадує `--config`.
+/// CLI на clap — `--version`/`--help` виходять з кодом 0, `--help` згадує `--config`.
 #[test]
 fn cli_help_and_version_exit_zero() {
     let out = Command::new(env!("CARGO_BIN_EXE_llmrt"))
@@ -837,7 +840,7 @@ fn cli_help_and_version_exit_zero() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("--config"));
 }
 
-/// B1 §1: дитина вмирає посеред стріму — і локально, і на сусіді клієнт дочитує тіло без
+/// Дитина вмирає посеред стріму — і локально, і на сусіді клієнт дочитує тіло без
 /// помилки транспорту, а остання подія — `upstream_lost` з іменем виконавця.
 #[test]
 fn stream_break_ends_with_upstream_lost_event_locally_and_via_peer() {
@@ -892,7 +895,7 @@ fn stream_break_ends_with_upstream_lost_event_locally_and_via_peer() {
     );
 }
 
-/// B1 §1: обрив посеред рядка — клієнт не бачить половини події, лише цілі й нашу `error`.
+/// Обрив посеред рядка — клієнт не бачить половини події, лише цілі й нашу `error`.
 #[test]
 fn stream_break_mid_line_sends_only_whole_events() {
     let _s = serial();
@@ -918,8 +921,8 @@ fn stream_break_mid_line_sends_only_whole_events() {
     assert_upstream_lost(&body, "node7796", 2);
 }
 
-/// B1 §2: тіло `/exec` дропнуто посеред генерації (клієнт відпав) → inflight 0 задовго до кінця
-/// стріму, а в лозі — «stream dropped by peer»: мітка часу для приймання на справжній мережі.
+/// Тіло `/exec` дропнуто посеред генерації (клієнт відпав) → inflight 0 задовго до кінця
+/// стріму, а в лозі — «stream dropped by peer»: мітка часу для перевірки на справжній мережі.
 #[test]
 fn exec_stream_dropped_mid_generation_is_logged_and_frees_inflight() {
     use std::io::Read;

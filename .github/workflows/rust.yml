@@ -3,20 +3,52 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+  # Без фільтра гілок: фільтр перевіряє base, а в stacked PR base — не main.
   pull_request:
-    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Застарілий прогін PR скасовується; прогони push у main — ніколи.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  fmt:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      # Без аргументів читає rust-toolchain.toml разом із components.
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      # Публічний репозиторій: у коді не лишаємо посилань на приватні нотатки дизайну.
+      # .github/ не скануємо — тут лежить сам regex.
+      - name: No references to private docs
+        run: |
+          set +e
+          out=$(grep -rnE '§|\bspec [A-Z0-9]|спек[аиуіо]|checks\.md|\bF[1-9]\b[:)]|флейка A|fn \w*_spec_\w*' src tests docs README.md)
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ] || { echo "$out"; exit 1; }
+
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      # Після toolchain: ключ кешу містить версію rustc.
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
