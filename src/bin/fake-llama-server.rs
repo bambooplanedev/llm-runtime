@@ -16,6 +16,8 @@
 //! - `FAKE_LIST_DEVICES_LOG` — append a millisecond timestamp line to this file on every `--list-devices`.
 //! - `FAKE_LIST_DEVICES_SLEEP_MS` — sleep this long in the `--list-devices` branch before printing
 //!   (after the log line above), to simulate a wedged driver.
+//! - `FAKE_LIST_DEVICES_SLEEP_IF` — path; while that file exists, `--list-devices` sleeps 20 s, so a
+//!   test can wedge the driver only after the first load.
 //! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
 //! - `FAKE_NO_TAGS=1`       — `--help` omits `--tags`, as an llama.cpp build too old for llmrt.
 
@@ -78,6 +80,11 @@ async fn main() {
         if let Ok(ms) = std::env::var("FAKE_LIST_DEVICES_SLEEP_MS") {
             if let Ok(ms) = ms.parse() {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+        }
+        if let Ok(p) = std::env::var("FAKE_LIST_DEVICES_SLEEP_IF") {
+            if std::path::Path::new(&p).exists() {
+                tokio::time::sleep(Duration::from_secs(20)).await;
             }
         }
         let mem = std::env::var("FAKE_MEM_MB").unwrap_or_else(|_| "16384".into());

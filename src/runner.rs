@@ -229,6 +229,26 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Ціль витіснення стоїть у `Loading` без процесу — це резерв її пам'яті. На будь-якому виході
+/// задачі витіснення, крім успішного старту дитини (тоді процес уже є), паніка включно, guard
+/// повертає її в `Available`. Жертв не чіпає: їх переводять їхні очікувачі.
+struct EvictGuard {
+    runner: Runner,
+    target: String,
+}
+
+impl Drop for EvictGuard {
+    fn drop(&mut self) {
+        // Отруєний mutex (паніка під lock-ом) не має перетворити прибирання на abort.
+        let mut g = self.runner.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = g.slots.get_mut(&self.target) {
+            if s.model.entry.state == ModelState::Loading && s.proc_.is_none() {
+                s.model.entry.state = ModelState::Available;
+            }
+        }
+    }
+}
+
 impl Inner {
     fn used_mb(&self) -> u64 {
         self.slots
@@ -396,6 +416,33 @@ impl Inner {
         }
         Ok(())
     }
+
+    /// Аргументи CUDA-проби; на Metal reported free безглуздий — `None`.
+    fn probe_args(&self) -> Option<(Config, String, Duration)> {
+        self.device
+            .starts_with("CUDA")
+            .then(|| (self.cfg.clone(), self.device.clone(), self.probe_timeout))
+    }
+}
+
+/// CUDA-проба вільної пам'яті. Async, з таймаутом: завислий драйвер не має морозити pin-прохід
+/// у `run_background`, що чекає на `load`. `Err(SpawnFailed)` — драйвер не відповів вчасно.
+async fn probe_reported(
+    probe: Option<(Config, String, Duration)>,
+) -> Result<Option<u64>, LoadOutcome> {
+    let Some((cfg, device, timeout)) = probe else {
+        return Ok(None);
+    };
+    match crate::inventory::probe_free_mb_async(&cfg, timeout).await {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            tracing::warn!(
+                "--list-devices on {device} did not finish within {timeout:?}; \
+                 treating as a node problem (spawn failed)"
+            );
+            Err(LoadOutcome::SpawnFailed)
+        }
+    }
 }
 
 impl Runner {
@@ -561,36 +608,151 @@ impl Runner {
         }
     }
 
-    /// Async, бо CUDA-проба форкає процес. Дешеві перевірки — до неї: проба може
-    /// тривати секунди, і для моделі, що однаково не влізе, вона марна. `spawn` лишається
-    /// синхронним і на воркері (див. PDEATHSIG у `spawn`).
-    pub async fn load(&self, id: &str) -> LoadOutcome {
-        let probe = {
-            let g = self.0.lock().unwrap();
-            if let Err(o) = g.precheck(id) {
-                return o;
-            }
-            g.device
-                .starts_with("CUDA")
-                .then(|| (g.cfg.clone(), g.device.clone(), g.probe_timeout))
-        };
-        // На CUDA reported free враховує чужі процеси; на Metal воно безглузде.
-        // Асинхронно, з таймаутом — завислий драйвер не має морозити pin-прохід у
-        // `run_background`, що чекає саме на цей `.await`.
-        let reported = match probe {
-            Some((cfg, device, timeout)) => {
-                match crate::inventory::probe_free_mb_async(&cfg, timeout).await {
-                    Ok(v) => v,
-                    Err(_) => {
-                        tracing::warn!(
-                            "--list-devices on {device} did not finish within {timeout:?}; \
-                             treating as a node problem (spawn failed)"
-                        );
-                        return LoadOutcome::SpawnFailed;
+    /// Під lock-ом: обрати жертв, послати їм SIGKILL, зарезервувати пам'ять під ціль.
+    /// `None` — витісненням не влізе. Повертає жертв і їхніх очікувачів.
+    ///
+    /// Сигнал — тут, під lock-ом: якщо runtime зупиниться раніше, ніж почнеться очікування,
+    /// жертва однаково вбита. Очікувач — той самий патерн, що в idle-зупинці: `wait` на
+    /// blocking-потоці, потім `Draining → Available`, лише якщо слот ще `Draining`
+    /// (`shutdown()` теж ставить `Available`).
+    fn start_eviction(
+        &self,
+        g: &mut Inner,
+        target: &str,
+    ) -> Option<Vec<(String, tokio::task::JoinHandle<()>)>> {
+        let need = g.slots[target].model.entry.need_mb;
+        let victims = pick_victims(
+            &g.victim_cands(),
+            need,
+            g.free_mb(),
+            Instant::now(),
+            g.evict_idle,
+        )?;
+        if victims.is_empty() {
+            return None; // precheck сказав NoMemory, тож порожнім цей список не буває
+        }
+        let mut waiters = Vec::new();
+        for v in victims {
+            let s = g
+                .slots
+                .get_mut(&v)
+                .expect("victim_cands lists existing slots");
+            let mut p = s
+                .proc_
+                .take()
+                .expect("victim_cands lists only slots with a process");
+            s.model.entry.state = ModelState::Draining;
+            let _ = p.child.kill();
+            tracing::info!("{v}: evicted for {target}");
+            let runner = self.clone();
+            let id = v.clone();
+            let h = tokio::task::spawn_blocking(move || {
+                let _ = p.child.wait();
+                let mut g = runner.0.lock().unwrap();
+                if let Some(s) = g.slots.get_mut(&id) {
+                    if s.model.entry.state == ModelState::Draining {
+                        s.model.entry.state = ModelState::Available;
+                        s.model.entry.inflight = 0;
                     }
                 }
+            });
+            waiters.push((v, h));
+        }
+        // Loading без процесу: used_mb рахує повний need_mb цілі, busy() береже її від переску,
+        // precheck дає AlreadyLoadedOrLoading — другий запит приєднується.
+        g.slots.get_mut(target).unwrap().model.entry.state = ModelState::Loading;
+        Some(waiters)
+    }
+
+    /// Решта витіснення, поза lock-ом. Запускається в `tokio::spawn` (див. `load`): скинутий future
+    /// `/load` (таймаут gateway, відпалий клієнт) задачу лише від'єднує. `spawn` дитини йде з
+    /// async-воркера, як і без витіснення (див. PDEATHSIG у `Inner::spawn`).
+    async fn eviction_task(
+        self,
+        target: String,
+        mut waiters: Vec<(String, tokio::task::JoinHandle<()>)>,
+    ) -> LoadOutcome {
+        // ПЕРШИМ: guard бере mutex у Drop, а локальні змінні звільняються у зворотному порядку.
+        // Оголошений після MutexGuard — він би заблокувався на власному lock-у.
+        let _guard = EvictGuard {
+            runner: self.clone(),
+            target: target.clone(),
+        };
+        let all_exited = async {
+            for (_, h) in waiters.iter_mut() {
+                let _ = h.await;
             }
-            None => None,
+        };
+        if tokio::time::timeout(EVICT_WAIT, all_exited).await.is_err() {
+            let stuck: Vec<&str> = waiters
+                .iter()
+                .filter(|(_, h)| !h.is_finished())
+                .map(|(id, _)| id.as_str())
+                .collect();
+            tracing::warn!(
+                "eviction for {target} abandoned: {} did not exit within {EVICT_WAIT:?}",
+                stuck.join(", ")
+            );
+            return LoadOutcome::NoMemory;
+        }
+        let probe = self.0.lock().unwrap().probe_args();
+        let reported = match probe_reported(probe).await {
+            Ok(v) => v,
+            Err(o) => return o,
+        };
+        let mut g = self.0.lock().unwrap();
+        if g.shutting_down {
+            return LoadOutcome::ShuttingDown;
+        }
+        let Some(s) = g.slots.get(&target) else {
+            return LoadOutcome::SpawnFailed;
+        };
+        // Інакше ціль уже не наш резерв (shutdown поставив Available) — не стартуємо.
+        if s.model.entry.state != ModelState::Loading || s.proc_.is_some() {
+            return LoadOutcome::SpawnFailed;
+        }
+        // Облік перевіряти не треба: резерв цілі вже в used_mb. Лише реальна VRAM на CUDA.
+        if reported.is_some_and(|free| s.model.entry.need_mb > free) {
+            return LoadOutcome::NoMemory;
+        }
+        match g.spawn(&target) {
+            Ok(()) => LoadOutcome::Accepted,
+            Err(e) => {
+                tracing::error!("spawn {target}: {e:#}");
+                LoadOutcome::SpawnFailed
+            }
+        }
+    }
+
+    /// Async, бо CUDA-проба форкає процес. Дешеві перевірки — до неї: проба може
+    /// тривати секунди, і для моделі, що однаково не влізе, вона марна. `spawn` лишається
+    /// синхронним і на воркері (див. PDEATHSIG у `spawn`). Не влазить, але влізе на місці
+    /// моделей, що простоюють, — витіснення (`start_eviction`, `eviction_task`).
+    pub async fn load(&self, id: &str) -> LoadOutcome {
+        // Або аргументи CUDA-проби (звичайний шлях), або очікувачі жертв (витіснення).
+        let (probe, evict) = {
+            let mut g = self.0.lock().unwrap();
+            match g.precheck(id) {
+                Ok(()) => (g.probe_args(), None),
+                // NoMemory для Available-цілі — брак пам'яті (для Draining-цілі — інша причина).
+                Err(LoadOutcome::NoMemory)
+                    if g.slots[id].model.entry.state == ModelState::Available =>
+                {
+                    match self.start_eviction(&mut g, id) {
+                        Some(w) => (None, Some(w)),
+                        None => return LoadOutcome::NoMemory,
+                    }
+                }
+                Err(o) => return o,
+            }
+        };
+        if let Some(waiters) = evict {
+            let task = tokio::spawn(self.clone().eviction_task(id.to_string(), waiters));
+            return task.await.unwrap_or(LoadOutcome::SpawnFailed);
+        }
+        let reported = match probe_reported(probe).await {
+            Ok(v) => v,
+            Err(o) => return o,
         };
 
         let mut g = self.0.lock().unwrap();

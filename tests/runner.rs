@@ -782,3 +782,216 @@ async fn reclaimable_mb_counts_only_idle_loaded_models() {
     bg.abort();
     r.shutdown().await;
 }
+
+/// Конфіг для тестів витіснення: idle-зупинка далеко (інакше вона змагалась би з витісненням),
+/// поріг витіснення 0 — модель придатна, щойно без запитів.
+fn evict_cfg(ports: (u16, u16)) -> Config {
+    let mut c = cfg();
+    c.child_ports = ports;
+    c.idle_timeout_secs = 30;
+    c.evict_idle_secs = 0;
+    c
+}
+
+fn state_of(r: &Runner, id: &str) -> ModelState {
+    r.snapshot().0.iter().find(|m| m.id == id).unwrap().state
+}
+
+fn cuda(limit: u64) -> Hw {
+    Hw {
+        device: "CUDA0".into(),
+        device_name: "x".into(),
+        mem_limit_mb: limit,
+    }
+}
+
+#[tokio::test]
+async fn idle_model_is_evicted_for_one_that_does_not_fit() {
+    let r = Runner::new(
+        &evict_cfg((7632, 7633)),
+        hw(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let out = r.load("b").await;
+    assert!(matches!(out, LoadOutcome::Accepted), "{out:?}");
+    assert_eq!(
+        state_of(&r, "a"),
+        ModelState::Available,
+        "the victim is gone"
+    );
+    wait_loaded(&r, "b").await;
+    assert_eq!(r.snapshot().1, 500, "only b is charged");
+    bg.abort();
+    r.shutdown().await;
+}
+
+#[tokio::test]
+async fn busy_young_or_pinned_models_are_not_evicted() {
+    // Молодша за поріг.
+    let mut c = evict_cfg((7634, 7635));
+    c.evict_idle_secs = 30;
+    let r = Runner::new(
+        &c,
+        hw(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    assert!(matches!(r.load("b").await, LoadOutcome::NoMemory));
+    assert_eq!(state_of(&r, "a"), ModelState::Loaded);
+    bg.abort();
+    r.shutdown().await;
+
+    // Запит у польоті; після нього — позитивний контроль.
+    let c = evict_cfg((7634, 7635));
+    let r = Runner::new(
+        &c,
+        hw(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let ExecTarget::Ready { guard, .. } = r.exec_target("a") else {
+        panic!()
+    };
+    assert!(matches!(r.load("b").await, LoadOutcome::NoMemory));
+    assert_eq!(state_of(&r, "a"), ModelState::Loaded, "a request in flight");
+    drop(guard);
+    assert!(matches!(r.load("b").await, LoadOutcome::Accepted));
+    bg.abort();
+    r.shutdown().await;
+
+    // Pinned.
+    let mut c = evict_cfg((7634, 7635));
+    c.pin = vec!["a".into()];
+    let r = Runner::new(
+        &c,
+        hw(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    wait_loaded(&r, "a").await;
+    assert!(matches!(r.load("b").await, LoadOutcome::NoMemory));
+    assert_eq!(state_of(&r, "a"), ModelState::Loaded, "pinned");
+    bg.abort();
+    r.shutdown().await;
+}
+
+/// Поки жертви виходять і йде CUDA-проба (500 ms < fast-tick таймаут 1 s), ціль видно як
+/// `loading`, і другий запит на неї приєднується, а не витісняє вдруге.
+#[tokio::test]
+async fn eviction_target_is_loading_and_a_second_load_joins() {
+    let mut c = evict_cfg((7636, 7637));
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=500 {}", fake());
+    let r = Runner::new(
+        &c,
+        cuda(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let r2 = r.clone();
+    let first = tokio::spawn(async move { r2.load("b").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(state_of(&r, "b"), ModelState::Loading, "{:?}", r.snapshot());
+    assert!(matches!(
+        r.load("b").await,
+        LoadOutcome::AlreadyLoadedOrLoading
+    ));
+    let out = first.await.unwrap();
+    assert!(matches!(out, LoadOutcome::Accepted), "{out:?}");
+    wait_loaded(&r, "b").await;
+    bg.abort();
+    r.shutdown().await;
+}
+
+/// Справжня вільна VRAM після виходу жертви все одно замала: `NoMemory`, жертва вже вивантажена
+/// (прийнята ціна), а ціль знову `available`, не `loading` без процесу.
+#[tokio::test]
+async fn cuda_still_short_after_eviction_leaves_target_available() {
+    let mut c = evict_cfg((7638, 7638));
+    c.llama_server = format!("env FAKE_MEM_MB=900 {}", fake());
+    let r = Runner::new(
+        &c,
+        cuda(1500),
+        vec![lm("a", 800), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let out = r.load("b").await;
+    assert!(matches!(out, LoadOutcome::NoMemory), "{out:?}");
+    assert_eq!(state_of(&r, "a"), ModelState::Available);
+    assert_eq!(state_of(&r, "b"), ModelState::Available);
+    assert_eq!(r.snapshot().1, 1500, "nothing is charged any more");
+    bg.abort();
+    r.shutdown().await;
+}
+
+/// Викликач здається посеред витіснення (таймаут gateway, відпалий клієнт) — задача однаково
+/// доводить завантаження до кінця.
+#[tokio::test]
+async fn dropped_load_still_finishes_the_eviction() {
+    let mut c = evict_cfg((7639, 7640));
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=500 {}", fake());
+    let r = Runner::new(
+        &c,
+        cuda(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let out = tokio::time::timeout(Duration::from_millis(100), r.load("b")).await;
+    assert!(
+        out.is_err(),
+        "the caller must give up mid-eviction: {out:?}"
+    );
+    wait_loaded(&r, "b").await;
+    bg.abort();
+    r.shutdown().await;
+}
+
+/// CUDA-проба після витіснення зависла: `SpawnFailed`, ціль не лишається `loading`, і наступна
+/// спроба знову може вантажити.
+#[tokio::test]
+async fn probe_timeout_after_eviction_leaves_target_loadable() {
+    let flag = tempfile::tempdir().unwrap();
+    let wedge = flag.path().join("wedge");
+    let mut c = evict_cfg((7641, 7642));
+    c.llama_server = format!(
+        "env FAKE_LIST_DEVICES_SLEEP_IF={} {}",
+        wedge.display(),
+        fake()
+    );
+    let r = Runner::new(
+        &c,
+        cuda(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    std::fs::write(&wedge, "").unwrap();
+    let out = r.load("b").await;
+    assert!(matches!(out, LoadOutcome::SpawnFailed), "{out:?}");
+    assert_eq!(state_of(&r, "b"), ModelState::Available);
+    std::fs::remove_file(&wedge).unwrap();
+    assert!(matches!(r.load("b").await, LoadOutcome::Accepted));
+    bg.abort();
+    r.shutdown().await;
+}

@@ -37,6 +37,12 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
 // таймаут запиту довший за connect-таймаут: інакше першим спрацює він, і це буде просто timeout.
 const _: () = assert!(LOAD_TIMEOUT.as_secs() > crate::net::CONNECT_TIMEOUT.as_secs());
 const _: () = assert!(EXEC_TIMEOUT.as_secs() > crate::net::CONNECT_TIMEOUT.as_secs());
+// `/load` з витісненням: жертви виходять (≤ EVICT_WAIT), потім CUDA-проба (≤ PROBE_TIMEOUT) —
+// разом мусить бути коротше за таймаут виклику, інакше gateway здасться раніше за вузол.
+const _: () = assert!(
+    crate::runner::EVICT_WAIT.as_secs() + crate::runner::PROBE_TIMEOUT.as_secs()
+        < LOAD_TIMEOUT.as_secs()
+);
 
 /// Максимум два повтори `pick`.
 const MAX_RETRIES: u32 = 2;
