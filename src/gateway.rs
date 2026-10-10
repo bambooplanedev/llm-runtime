@@ -11,7 +11,7 @@ use crate::planner::{self, NoPick, Pair, Pick, TIER_NAMES};
 use crate::reqlog::{Record, ReqLog};
 use crate::runner::{ExecTarget, LoadOutcome, Runner};
 use crate::sse::{self, EventGate};
-use crate::state::{now_secs, Cluster, Hw, ModelState, NodeState, NodeView, PROTO};
+use crate::state::{now_secs, Api, Cluster, Hw, ModelState, NodeState, NodeView, PROTO};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
@@ -389,6 +389,10 @@ pub fn no_pick_status(n: NoPick) -> (u16, &'static str) {
         NoPick::UnknownModel => (400, "unknown model"),
         NoPick::NoSuchTier => (503, "no model of this tier in the cluster"),
         NoPick::AllBusy => (503, "no node can take this model right now"),
+        NoPick::ApiUnsupported => (
+            503,
+            "no node with this model supports this endpoint; upgrade llmrt there",
+        ),
     }
 }
 
@@ -560,7 +564,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
     for attempt in 0..=MAX_RETRIES {
         rec.retries = attempt;
         let cluster = cluster_with_self(&gw);
-        let pick = match planner::pick(&cluster, &want, &gw.cfg.tiers, &exclude) {
+        let pick = match planner::pick(&cluster, &want, &gw.cfg.tiers, &exclude, Api::Chat) {
             Ok(p) => p,
             Err(n) => {
                 let (code, msg) = no_pick_status(n);
@@ -874,6 +878,10 @@ mod tests {
         assert_eq!(no_pick_status(crate::planner::NoPick::UnknownModel).0, 400);
         assert_eq!(no_pick_status(crate::planner::NoPick::NoSuchTier).0, 503);
         assert_eq!(no_pick_status(crate::planner::NoPick::AllBusy).0, 503);
+        assert_eq!(
+            no_pick_status(crate::planner::NoPick::ApiUnsupported).0,
+            503
+        );
     }
 
     #[test]
