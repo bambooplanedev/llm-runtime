@@ -287,6 +287,20 @@ pub fn prepare_upstream_body(body: &mut serde_json::Value, model_id: &str, api: 
     }
 }
 
+/// llama.cpp відхиляє `n_cmpl` більше за кількість слотів (`-np`) з 400, а llama.vscode за
+/// замовчуванням шле 3. Одна підказка краща за жодну: обрізаємо до слотів обраної моделі.
+pub fn clamp_n_cmpl(body: &mut serde_json::Value, slots: u32) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let max = u64::from(slots.max(1));
+    if let Some(n) = obj.get("n_cmpl").and_then(|v| v.as_u64()) {
+        if n > max {
+            obj.insert("n_cmpl".into(), max.into());
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpstreamErr {
     /// Connect не вдався: refused, unreachable, connect-timeout, DNS.
@@ -536,12 +550,20 @@ impl Finish {
             None => text.trim(),
         };
         if let Ok(j) = serde_json::from_str::<serde_json::Value>(payload) {
-            // `tokens_predicted` — нативний `/infill`, у ньому немає `usage`.
-            if j.get("usage").is_some()
+            if self.streaming {
+                // `tokens_predicted` — нативний `/infill`, у ньому немає `usage`.
+                if j.get("usage").is_some()
+                    || j.get("timings").is_some()
+                    || j.get("tokens_predicted").is_some()
+                {
+                    ReqLog::fill_from_final_chunk(&mut self.rec, &j);
+                }
+            } else if j.is_array()
+                || j.get("usage").is_some()
                 || j.get("timings").is_some()
                 || j.get("tokens_predicted").is_some()
             {
-                ReqLog::fill_from_final_chunk(&mut self.rec, &j);
+                ReqLog::fill_from_body(&mut self.rec, &j);
             }
         }
     }
@@ -626,10 +648,11 @@ async fn proxy(gw: Gateway, raw: Bytes, api: Api) -> Response {
         rec.node_id = pick.pair.node_id.clone();
         rec.model_id = pick.pair.model_id.clone();
         rec.cold = pick.cold;
-        rec.active_params_b = cluster
+        let picked = cluster
             .get(&pick.pair.node_id)
-            .and_then(|v| v.state.models.iter().find(|m| m.id == pick.pair.model_id))
-            .and_then(|m| m.active_params_b);
+            .and_then(|v| v.state.models.iter().find(|m| m.id == pick.pair.model_id));
+        rec.active_params_b = picked.and_then(|m| m.active_params_b);
+        let slots = picked.map(|m| m.slots).unwrap_or(1);
         // Ім'я виконавця — для події `upstream_lost`; `cluster_with_self` містить і нас.
         let exec_name = cluster
             .get(&pick.pair.node_id)
@@ -689,6 +712,9 @@ async fn proxy(gw: Gateway, raw: Bytes, api: Api) -> Response {
 
         let mut up_body = body.clone();
         prepare_upstream_body(&mut up_body, &pick.pair.model_id, api);
+        if api == Api::Infill {
+            clamp_n_cmpl(&mut up_body, slots);
+        }
         let r = gw
             .http
             .post(format!("http://{}/exec", pick.addr))
@@ -824,6 +850,28 @@ fn give_up(gw: &Gateway, mut rec: Record, started: Instant, code: u16, msg: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_n_cmpl_caps_at_slots() {
+        let mut b = serde_json::json!({"n_cmpl": 3});
+        clamp_n_cmpl(&mut b, 1);
+        assert_eq!(b["n_cmpl"], 1);
+        let mut b = serde_json::json!({"n_cmpl": 2});
+        clamp_n_cmpl(&mut b, 4);
+        assert_eq!(b["n_cmpl"], 2);
+        let mut b = serde_json::json!({"input_prefix": "x"});
+        clamp_n_cmpl(&mut b, 1);
+        assert!(b.get("n_cmpl").is_none());
+        let mut b = serde_json::json!({"n_cmpl": "3"});
+        clamp_n_cmpl(&mut b, 1);
+        assert_eq!(b["n_cmpl"], "3");
+        let mut b = serde_json::json!({"n_cmpl": 3});
+        clamp_n_cmpl(&mut b, 0);
+        assert_eq!(b["n_cmpl"], 1);
+        let mut b = serde_json::json!([1, 2]);
+        clamp_n_cmpl(&mut b, 1);
+        assert_eq!(b, serde_json::json!([1, 2]));
+    }
 
     #[test]
     fn injects_include_usage_only_for_stream() {

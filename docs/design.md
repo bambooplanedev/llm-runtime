@@ -163,7 +163,8 @@ above it. Keys after that are heuristics until the logs exist. "GPU before CPU" 
 revision was removed as a weight without data.
 
 `/v1/completions` and `/infill` go through the same path as chat. `/infill` takes `model` from the
-body, or `infill_model` from the config when the body has none (llama.vscode sends none).
+body, or `infill_model` from the config when the body has none (llama.vscode sends none). For `/infill` the gateway caps `n_cmpl` at the chosen model's `slots`,
+because llama.cpp rejects a larger value with 400.
 
 ### Execution
 
@@ -247,9 +248,11 @@ One JSON line per request in `<data_dir>/requests.jsonl`: time, requested `model
 (`chat`, `completions`, `infill`), chosen node and model, active parameters for MoE, cold start
 flag, `pick` retries, prompt and completion tokens, TTFT, generation time, wall-clock, status, error
 reason. Tokens and timings come from the last SSE event that has them: `usage` (chat, completions)
-or `tokens_evaluated` and `tokens_predicted` (infill), plus `timings`. Nothing is counted per chunk.
+or `tokens_evaluated` and `tokens_predicted` (infill), plus `timings`. A non-stream `/infill` with
+several completions returns an array: prompt tokens and timings come from the first element,
+completion tokens are summed. Nothing is counted per chunk.
 TTFT is the first byte from the executor, so for a non-stream request it is close to the whole
-generation. This log is the raw material for the automatic-tier spec. Without it step 1 is not
+generation. This log is the raw material for the automatic-tier work. Without it step 1 is not
 done.
 
 ## 6. `llama-server` lifecycle
@@ -359,7 +362,7 @@ build.
 | Closed socket, non-stream | `cancel task` in the server log within ~1 s, slot released | Closing the upstream connection is enough |
 | hyper on client disconnect | Drops the handler future as soon as the client closes, before the first byte. `inflight` returns to 0 in ~2.7 ms against a 3 s prefill | No need to wait for a failed write |
 | `/v1/completions` (b11429) | OpenAI `text_completion`; the final stream chunk has `usage` and `timings` even without `stream_options`, then `[DONE]` | Same log path as chat; `include_usage` is still injected for other builds |
-| `/infill` (b11429) | Native format, ignores `model`; every stream chunk has `tokens_predicted` and `tokens_evaluated`, the last one `timings`; no `[DONE]` | Tokens come from `tokens_*`; the stream ends when the connection closes |
+| `/infill` (b11429) | Native format, ignores `model`; every stream chunk has `tokens_predicted` and `tokens_evaluated`, the last one `timings`; no `[DONE]` | Tokens come from `tokens_*`; the stream ends when the connection closes. `n_cmpl` above `-np` → 400; `n_cmpl > 1` non-stream → an array |
 
 Not verified: `--list-devices` on CUDA (assumed `CUDA0: <name> (N MiB, M MiB free)`).
 

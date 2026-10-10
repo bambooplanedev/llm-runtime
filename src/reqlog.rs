@@ -82,6 +82,25 @@ impl ReqLog {
         warned
     }
 
+    /// Те саме для цілого non-stream тіла. Нативний `/infill` з `n_cmpl > 1` повертає масив:
+    /// промпт-токени й `timings` беремо з першого елемента, а токени генерації сумуємо по всіх.
+    pub fn fill_from_body(r: &mut Record, body: &serde_json::Value) {
+        let Some(items) = body.as_array() else {
+            Self::fill_from_final_chunk(r, body);
+            return;
+        };
+        if let Some(first) = items.first() {
+            Self::fill_from_final_chunk(r, first);
+        }
+        let counts: Vec<u64> = items
+            .iter()
+            .filter_map(|i| i.get("tokens_predicted").and_then(|v| v.as_u64()))
+            .collect();
+        if !counts.is_empty() {
+            r.completion_tokens = Some(counts.iter().sum());
+        }
+    }
+
     /// Витягує токени (`usage` або `tokens_*`) і `timings` з фінального чанка стріму (llama.cpp).
     pub fn fill_from_final_chunk(r: &mut Record, chunk: &serde_json::Value) {
         // `usage` — chat і completions; `tokens_*` — нативний `/infill` llama.cpp.
@@ -109,6 +128,25 @@ impl ReqLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fills_from_an_array_body_summing_completion_tokens() {
+        let one = serde_json::json!({
+            "tokens_predicted": 4, "tokens_evaluated": 13,
+            "timings": {"predicted_ms": 16.0, "predicted_per_second": 125.0}
+        });
+        let arr = serde_json::json!([one, one, one]);
+        let mut r = Record::default();
+        ReqLog::fill_from_body(&mut r, &arr);
+        assert_eq!(r.prompt_tokens, Some(13));
+        assert_eq!(r.completion_tokens, Some(12));
+        assert_eq!(r.predicted_per_second, Some(125.0));
+
+        let mut r = Record::default();
+        ReqLog::fill_from_body(&mut r, &one);
+        assert_eq!(r.prompt_tokens, Some(13));
+        assert_eq!(r.completion_tokens, Some(4));
+    }
 
     #[test]
     fn fills_usage_and_timings_from_last_chunk() {

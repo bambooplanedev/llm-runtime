@@ -21,6 +21,8 @@
 //! - `FAKE_CHAT_STATUS` — answer every chat, completions and infill request with this status and an
 //!   `exceed_context_size_error` body. `FAKE_TOKENS`, `FAKE_PREFILL_MS`, `FAKE_DIE_MID_STREAM` apply to
 //!   all three routes too; `FAKE_DIE_MID_LINE` to chat only.
+//! - `/infill` answers 400 when `n_cmpl` exceeds `-np` (as llama.cpp does); a non-stream `n_cmpl > 1`
+//!   returns an array of `n_cmpl` objects. Streaming always carries a single completion.
 //! - `FAKE_NO_TAGS=1`       — `--help` omits `--tags`, as an llama.cpp build too old for llmrt.
 
 use axum::{
@@ -297,7 +299,8 @@ async fn chat(
     Sse::new(s).into_response()
 }
 
-/// Спільний початок трьох генеруючих маршрутів: «вантажиться», `FAKE_CHAT_STATUS`, prefill.
+/// Спільний початок `completions` і `infill`: «вантажиться», `FAKE_CHAT_STATUS`, prefill.
+/// `chat` має власну копію того самого.
 async fn gen_prelude(a: &App) -> Option<axum::response::Response> {
     if loading(a) {
         return Some(loading_err().into_response());
@@ -392,14 +395,29 @@ async fn infill(
     if let Some(r) = gen_prelude(&a).await {
         return r;
     }
+    // Як справжній llama-server: `n_cmpl` більше за кількість слотів (`-np`) — 400.
+    let n_cmpl = body.get("n_cmpl").and_then(|v| v.as_u64()).unwrap_or(1);
+    if n_cmpl > a.slots {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":{"code":400,
+                "message":format!("Field 'n_cmpl': Value must be between 1 <= value <= {}, but got {}", a.slots, n_cmpl),
+                "type":"invalid_request_error"}})),
+        )
+            .into_response();
+    }
     let timings = fake_timings(&a);
     if !streaming(&body) {
-        return Json(
-            serde_json::json!({"index":0,"content":"hello from fake","tokens":[],"id_slot":0,
+        let one = |i: u64| {
+            serde_json::json!({"index":i,"content":"hello from fake","tokens":[],"id_slot":0,
             "stop":true,"model":a.alias,"tokens_predicted":a.tokens,"tokens_evaluated":7,
-            "timings":timings}),
-        )
-        .into_response();
+            "timings":timings})
+        };
+        // Кілька completions у non-stream — масив, як у справжнього.
+        if n_cmpl > 1 {
+            return Json(serde_json::Value::Array((0..n_cmpl).map(one).collect())).into_response();
+        }
+        return Json(one(0)).into_response();
     }
     let mut ev: Vec<String> = (0..a.tokens)
         .map(|i| {

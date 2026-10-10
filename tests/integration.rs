@@ -97,6 +97,8 @@ struct Opts<'a> {
     envs: &'a [(&'a str, &'a str)],
     /// Куди писати stdout демона (його логи); `None` — як `logs()`.
     log_file: Option<&'a std::path::Path>,
+    /// Вміст `llama_args` у TOML (масив рядків).
+    llama_args: &'a str,
 }
 
 impl Default for Opts<'_> {
@@ -106,6 +108,7 @@ impl Default for Opts<'_> {
             extra_toml: "",
             envs: &[],
             log_file: None,
+            llama_args: r#"["-c", "1024"]"#,
         }
     }
 }
@@ -142,7 +145,7 @@ os_reserve_mb = 0
 idle_timeout_secs = 600
 load_wait_secs = {}
 data_dir = "{}"
-llama_args = ["-c", "1024"]
+llama_args = {}
 {}
 "#,
             mdir.display(),
@@ -150,6 +153,7 @@ llama_args = ["-c", "1024"]
             peers.join(","),
             o.load_wait_secs,
             dir.path().join("data").display(),
+            o.llama_args,
             o.extra_toml,
         ),
     )
@@ -1475,6 +1479,71 @@ fn completions_and_infill_reach_their_child_routes_and_are_logged() {
     );
 }
 
+/// llama.vscode шле `n_cmpl: 3` на кожне доповнення. З `-np 1` справжній llama-server відповів би
+/// 400, тож gateway обрізає `n_cmpl` до слотів моделі; з `-np 3` масив із трьох доходить цілим,
+/// а в лозі токени підсумовуються.
+#[test]
+fn llama_vscode_parallel_completions_fit_the_slots() {
+    let _s = serial();
+    let a = spawn_with(
+        7816,
+        "7866-7869",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let req = serde_json::json!({"input_prefix": "x = ", "input_suffix": "", "n_cmpl": 3});
+    let (code, body) = post_json(a.port, "/infill", req.clone());
+    assert_eq!(code, 200, "{body}");
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        j.is_object() && j.get("tokens_predicted").is_some(),
+        "{body}"
+    );
+    wait_log(
+        a.dir.path(),
+        |r| {
+            r.iter()
+                .any(|x| x["api"] == "infill" && x["status"] == 200 && x["completion_tokens"] == 5)
+        },
+        "infill record with 5 completion tokens",
+    );
+    drop(a);
+
+    let b = spawn_with(
+        7829,
+        "7862-7865",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            llama_args: r#"["-c", "1024", "-np", "3"]"#,
+            ..Default::default()
+        },
+    );
+    node_up(b.port, 1);
+    let (code, body) = post_json(b.port, "/infill", req);
+    assert_eq!(code, 200, "{body}");
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(j.as_array().map(|a| a.len()), Some(3), "{body}");
+    wait_log(
+        b.dir.path(),
+        |r| {
+            r.iter().any(|x| {
+                x["api"] == "infill"
+                    && x["status"] == 200
+                    && x["completion_tokens"] == 15
+                    && x["prompt_tokens"] == 7
+            })
+        },
+        "infill record with 15 completion tokens",
+    );
+}
+
 /// Без `model` і без `infill_model` — 400 з підказкою; `infill_model` з невідомим id —
 /// зрозуміле `400 unknown model`.
 #[test]
@@ -1496,6 +1565,15 @@ fn infill_without_a_model_is_a_clear_400() {
     );
     assert_eq!(code, 400, "{body}");
     assert!(body.contains("model is required"), "{body}");
+    // Невідомий `api` в `/exec` — 404 з `/state` вузла (щоб gateway побачив, що вузол його не знає).
+    let (code, body) = post_json(
+        a.port,
+        "/exec",
+        serde_json::json!({"model": "tiny-0.2b", "api": "responses", "body": {}}),
+    );
+    assert_eq!(code, 404, "{body}");
+    let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(st["node_id"].is_string(), "{body}");
     drop(a);
 
     let b = spawn_with(

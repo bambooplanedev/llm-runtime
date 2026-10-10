@@ -127,7 +127,10 @@ pin = ["qwen2.5-coder-1.5b-q8_0"]   # keep it loaded: otherwise idle stop and ev
 
 - **llama.vscode:** set the completion endpoint to `http://<node>:7411` and leave its model field
   empty (or set it to an llmrt model id). It sends `/infill` without `model`, so llmrt uses
-  `infill_model`.
+  `infill_model`. It asks for several suggestions at once (`Max Parallel Completions`, default 3);
+  llmrt caps that at the model's slots (`-np`), so with the default `-np 1` you get one
+  suggestion. For more, set `-np` on that node in `llama_args` (each slot gets `-c / -np` context
+  and the KV memory is shared).
 - **Continue and other OpenAI clients:** use `http://<node>:7411/v1` as the API base; they call
   `/v1/completions` with a model id or tier.
 
