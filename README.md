@@ -40,6 +40,7 @@ Design doc: [docs/design.md](docs/design.md).
 ```bash
 brew install llama.cpp        # or the official `llama` launcher from llama.cpp releases
 llama --version               # newer builds expose the server as `llama serve`
+llama serve --help | grep -- --tags   # llmrt needs a build with --tags (b11046 or newer)
 cargo build --release         # produces ./target/release/llmrt
 ```
 

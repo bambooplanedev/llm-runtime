@@ -8,6 +8,10 @@ This guide takes you from zero to two machines serving one OpenAI-compatible end
 llmrt starts `llama-server` (or `llama serve` in newer builds) as a child process. It does not
 download llama.cpp.
 
+llmrt needs a build whose `--help` lists `--tags` (verified on b11046); with an older build the
+daemon refuses to start and says so. All nodes must run the same protocol: after upgrading llmrt
+on one node, upgrade the others too.
+
 **macOS (Apple Silicon)**
 
 ```bash
@@ -143,6 +147,8 @@ and model that executed it.
 | Symptom | Likely cause and fix |
 |---|---|
 | A node's models are missing from `/v1/models` | mDNS blocked (see Network) → set `peers`; firewall on 7411 |
+| A node is visible but never gets requests; the log says `proto N != 2, incompatible` | That node runs another llmrt version. Upgrade all nodes together |
+| The daemon exits with `llama.cpp too old … --tags` | Update llama.cpp on that node (see section 1) |
 | `503 no model of this tier in the cluster` | No model with a parameter count in that tier; check `tiers` in the config |
 | `503 no node can take this model right now` | The model does not fit in free memory anywhere; lower `-c`, unload something, or raise `mem_limit_mb` |
 | `503 model loading, retry` | A cold start takes longer than `load_wait_secs`; loading continues, retry shortly |
