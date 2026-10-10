@@ -316,6 +316,12 @@ async fn read_capped(u: reqwest::Response, limit: usize) -> Bytes {
     Bytes::from(out)
 }
 
+/// Причина помилки дитини для логу. Символи, не байти: зріз по байтах панікує на UTF-8.
+fn child_error(code: u16, body: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(body).chars().take(200).collect();
+    format!("child {code}: {text}")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChildErr {
     PassThrough,
@@ -327,12 +333,12 @@ pub enum ChildErr {
 pub fn classify_child(code: u16) -> ChildErr {
     match code {
         503 => ChildErr::Retry,
-        400..=499 => ChildErr::PassThrough,
+        400..=499 | 501 => ChildErr::PassThrough,
         _ => ChildErr::BadGateway,
     }
 }
 
-/// 4xx від llama.cpp — клієнту дослівно: `exceed_context_size_error` його SDK зрозуміє краще за 502.
+/// 4xx і 501 від llama.cpp — клієнту дослівно: `exceed_context_size_error` його SDK зрозуміє краще за 502.
 /// `give_up` не годиться: він завжди формує власне тіло.
 async fn pass_through(
     gw: &Gateway,
@@ -344,7 +350,7 @@ async fn pass_through(
     let ct = u.headers().get(header::CONTENT_TYPE).cloned();
     let body = read_capped(u, ERR_BODY_LIMIT).await;
     rec.status = code;
-    rec.error = Some(format!("child {code}"));
+    rec.error = Some(child_error(code, &body));
     rec.wall_ms = started.elapsed().as_millis() as u64;
     gw.log.write(&rec);
     let mut resp = (
@@ -412,7 +418,7 @@ pub fn no_pick_status(n: NoPick) -> (u16, &'static str) {
     }
 }
 
-/// Клієнт бачить лише 400/502/503 у форматі OpenAI.
+/// Клієнт бачить 400/502/503 у форматі OpenAI, а також 4xx і 501 самої дитини.
 fn err(code: u16, msg: &str) -> Response {
     (
         StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -703,10 +709,7 @@ async fn proxy(gw: Gateway, raw: Bytes, api: Api) -> Response {
                         ChildErr::PassThrough => return pass_through(&gw, rec, started, u).await,
                         ChildErr::BadGateway => {
                             let body = read_capped(u, ERR_BODY_LIMIT).await;
-                            // Символи, не байти: зріз по байтах панікує на UTF-8.
-                            let text: String =
-                                String::from_utf8_lossy(&body).chars().take(200).collect();
-                            rec.error = Some(format!("child {code}: {text}"));
+                            rec.error = Some(child_error(code, &body));
                             return give_up(&gw, rec, started, 502, "upstream failed");
                         }
                     }
@@ -967,6 +970,9 @@ mod tests {
 
     #[test]
     fn child_errors_pass_through_retry_or_502() {
+        // 501 — дитина прямо каже «не вмію» (модель без FIM): інший вузол з тією самою
+        // моделлю не допоможе, клієнт має побачити причину.
+        assert_eq!(classify_child(501), ChildErr::PassThrough);
         assert_eq!(classify_child(400), ChildErr::PassThrough);
         assert_eq!(classify_child(413), ChildErr::PassThrough);
         // 503 у llama-server — «вантажиться/недоступний»: інший вузол може відповісти.

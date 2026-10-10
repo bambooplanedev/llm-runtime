@@ -903,8 +903,181 @@ fn llama_cpp_4xx_reaches_the_client_verbatim() {
     assert!(
         log.lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-            .any(|r| r["status"] == 400 && r["error"] == "child 400"),
+            .any(|r| r["status"] == 400
+                && r["error"].as_str().is_some_and(
+                    |e| e.starts_with("child 400: ") && e.contains("fake context exceeded")
+                )),
         "{log}"
+    );
+}
+
+/// `501` дитини (модель без FIM, вимкнені embeddings) — клієнту дослівно і для chat, і для infill;
+/// у лозі причина з тіла.
+#[test]
+fn child_501_reaches_the_client_verbatim() {
+    let _s = serial();
+    let a = spawn_with(
+        7824,
+        "7842-7845",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            envs: &[("FAKE_CHAT_STATUS", "501")],
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let (code, body) = chat(a.port, "small", false);
+    assert_eq!(code, 501, "{body}");
+    assert!(body.contains("fake context exceeded"), "{body}");
+    let (code, body) = post_json(
+        a.port,
+        "/infill",
+        serde_json::json!({"input_prefix": "x", "input_suffix": ""}),
+    );
+    assert_eq!(code, 501, "{body}");
+    assert!(body.contains("fake context exceeded"), "{body}");
+    wait_log(
+        a.dir.path(),
+        |r| {
+            r.iter()
+                .filter(|x| {
+                    x["status"] == 501
+                        && x["error"]
+                            .as_str()
+                            .is_some_and(|e| e.starts_with("child 501: ") && e.contains("fake"))
+                })
+                .count()
+                == 2
+        },
+        "two 501 records with the child's reason",
+    );
+}
+
+/// Стрім `/infill` (без `[DONE]`) обривається — клієнт дочитує цілі події й `upstream_lost`,
+/// у лозі 502 з частковими лічильниками з `tokens_*`.
+#[test]
+fn infill_stream_break_ends_with_upstream_lost() {
+    let _s = serial();
+    let a = spawn_with(
+        7825,
+        "7846-7849",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            envs: &[("FAKE_DIE_MID_STREAM", "1")],
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let (code, body) = post_raw(
+        a.port,
+        "/infill",
+        serde_json::json!({"input_prefix": "x", "input_suffix": "", "stream": true}),
+    );
+    assert_eq!(code, 200);
+    let body = body.expect("client must read the body without a transport error");
+    assert_upstream_lost(&body, "node7825", 2);
+    wait_log(
+        a.dir.path(),
+        |r| {
+            r.iter().any(|x| {
+                x["api"] == "infill"
+                    && x["status"] == 502
+                    && x["error"] == "upstream_lost"
+                    && x["completion_tokens"] == 2
+                    && x["prompt_tokens"] == 7
+            })
+        },
+        "infill upstream_lost record with partial tokens",
+    );
+}
+
+/// Великий `input_extra` (контекст файлів у llama.vscode) — тіло понад дефолтні 2 МБ axum.
+#[test]
+fn infill_body_over_2_mb_is_accepted() {
+    let _s = serial();
+    let a = spawn_with(
+        7826,
+        "7850-7853",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    let big = "x".repeat(3 * 1024 * 1024);
+    let (code, body) = post_json(
+        a.port,
+        "/infill",
+        serde_json::json!({"input_prefix": big, "input_suffix": ""}),
+    );
+    assert_eq!(code, 200, "{}", &body[..body.len().min(300)]);
+}
+
+/// IDE скасовує non-stream `/infill` посеред prefill на кожне натискання — `inflight` вертається
+/// в 0, слот дитини не висить до кінця генерації.
+#[test]
+fn cancelled_infill_returns_inflight() {
+    let _s = serial();
+    let a = spawn_with(
+        7828,
+        "7858-7861",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            envs: &[("FAKE_PREFILL_MS", "3000")],
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    // Прогрів: модель вантажиться, перший запит чекає prefill повністю.
+    let (code, body) = post_json(
+        a.port,
+        "/infill",
+        serde_json::json!({"input_prefix": "x", "input_suffix": ""}),
+    );
+    assert_eq!(code, 200, "{body}");
+    wait_for(
+        a.port,
+        |v| v["models"][0]["state"] == "loaded" && v["models"][0]["inflight"] == 0,
+        "/state",
+        "warm, inflight 0",
+    );
+    // Окремий потік: спершу переконуємось, що inflight став 1, інакше «повернувся в 0» могло б
+    // збігтися з «ще не став 1». 1500 мс з запасом перекриває 200-мілісекундний такт опитування.
+    let h = std::thread::spawn(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1500))
+            .build()
+            .unwrap()
+            .post("http://127.0.0.1:7828/infill")
+            .json(&serde_json::json!({"input_prefix": "x", "input_suffix": ""}))
+            .send()
+            .err()
+            .map(|e| e.is_timeout())
+    });
+    wait_for(
+        a.port,
+        |v| v["models"][0]["inflight"] == 1,
+        "/state",
+        "inflight 1 while prefilling",
+    );
+    assert_eq!(
+        h.join().unwrap(),
+        Some(true),
+        "client must time out mid-prefill"
+    );
+    wait_for(
+        a.port,
+        |v| v["models"][0]["inflight"] == 0,
+        "/state",
+        "inflight back to 0 after the client gave up",
     );
 }
 
