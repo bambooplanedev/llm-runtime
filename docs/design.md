@@ -89,6 +89,7 @@ One JSON document per node at `GET /state`:
       "need_mb": 6800, "state": "loaded", "slots": 1, "inflight": 1 }
   ],
   "free_mb": 4100,
+  "reclaimable_mb": 0,
   "seen": 1757600000
 }
 ```
@@ -111,11 +112,15 @@ One JSON document per node at `GET /state`:
   other layers fits in the 512 MB. 512 MB is the compute buffer,
   the only named constant. After a child starts, runner reads `/props` and logs any mismatch
   between `n_ctx × total_slots` and `-c`. That is the formula's test on real models.
-- **`free_mb`** = `mem_limit_mb − os_reserve_mb − Σ need_mb` of loaded and loading models. On
-  CUDA it is additionally capped by free memory from `--list-devices`, which is real
+- **`free_mb`** = `mem_limit_mb − os_reserve_mb − Σ need_mb` of loading, loaded and draining models.
+  On CUDA it is additionally capped by free memory from `--list-devices`, which is real
   `cudaMemGetInfo`. That value already excludes what the OS and other processes hold, so
   `os_reserve_mb` is not subtracted from it a second time. On Metal the reported free value is
   meaningless and unused.
+- **`reclaimable_mb`** is the memory the node would free by evicting idle models right now: the
+  sum of `need_mb` of `loaded` models that are not pinned, have no request in flight and have been
+  idle for at least `evict_idle_secs`. A node without the field reads as `0`, so it simply never
+  evicts.
 - **Model `state`**: `available`, `loading`, `loaded`, `draining`, `failed`.
 - **`slots`** is `-np`. `llama-server` queues requests above `-np`, so `inflight` alone does not
   mean busy.
@@ -133,10 +138,12 @@ in step 1 and the hook for a future cascade. Tiers by `params_b`: `small < 3`, `
 
 1. Candidates: pairs (node, model) where the node is alive, `proto` matches, the pair is not in
    `exclude`, the model is `loaded`, `loading` or `available` and matches the tier or id.
-2. Drop `available` models where the node's `free_mb` is below `need_mb`. A `loading` model is
-   already counted in `free_mb` and is not dropped.
-3. Sort: `loaded`, then `loading` (join a cold start already under way), then `available`; then
-   more `params_b`, then fewer `inflight − slots`.
+2. Drop `available` models whose `need_mb` exceeds the node's `free_mb + reclaimable_mb`. A
+   `loading` model is already counted in `free_mb` and is not dropped.
+3. Sort: `loaded`, then `loading` (join a cold start already under way), then `available` that
+   fits in `free_mb`, then `available` that fits only after evicting idle models; then more
+   `params_b`, then fewer `inflight − slots`. Eviction is a fallback: a model that fits as is
+   always wins, even a smaller one.
 4. Empty means `None`. Gateway returns `503` with the reason.
 
 `params_b` as the second key is the thesis: the best model within the requested effort, never
@@ -157,6 +164,8 @@ revision was removed as a weight without data.
   the pair is excluded and `pick` runs again, so one slow start does not block the tier. If the
   request started the load itself, it gets `503 "model loading, retry"` and loading continues on
   the node.
+  When the model fits only after an eviction, `/load` first unloads the victims (see section 6),
+  so it can take up to about 25 s, and a `409` can also mean the eviction did not work out.
 - `/exec` returns `409` if the model is no longer `loaded`, and `503` with the state as body if
   the child died before the first byte.
 - On `409` or `503` the pair goes into `exclude`, the snapshot updates from the body, and `pick`
@@ -195,6 +204,7 @@ A node or model failure never becomes a network failure.
 | Connect refused, unreachable, DNS failure or connect timeout on `/load` or `/exec` | Node dead now, pair excluded, retry `pick` |
 | Read timeout on `/load` or `/exec` | Pair excluded, retry `pick`, node stays alive |
 | Model loads longer than `load_wait_secs` | `503 "model loading, retry"`, loading continues |
+| Eviction victim does not exit within 10 s, or real free VRAM is still short after it | `409`, pair excluded, retry `pick`. The victims stay unloaded; a retry may evict on another node |
 | Child died before the first byte | `/exec` → `503` with state, pair excluded, retry |
 | Node vanished mid-stream | Stream ends with an `upstream_lost` SSE event, log `upstream_lost`; the executing node frees the slot within ~25 s |
 | `/state` silent for 2 s | Miss. Third miss in a row marks dead, then poll every 10 s |
@@ -232,8 +242,9 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
   unaffected. At startup the daemon also runs `<llama_server> --help` and refuses to start if
   `--tags` is missing (older builds would fail every child start). Children listen on localhost
   only.
-- **Memory.** `need_mb ≤ free_mb` before start, otherwise refuse immediately. Layer placement
-  between VRAM and RAM within the limit is llama.cpp's job.
+- **Memory.** `need_mb ≤ free_mb` before start. Otherwise the node tries an eviction (below) and
+  refuses immediately if that cannot make room. Layer placement between VRAM and RAM within the
+  limit is llama.cpp's job.
 - **Readiness.** `loading` while `GET /health` returns `503 "Loading model"` and the process is
   alive. No wall-clock limit: 20 GB on a slow disk outlasts any constant, and a limit would produce
   a kill → available → kill loop. A process that dies during load becomes `failed`, not
@@ -247,7 +258,18 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
   the same mutex as `inflight`. The kill and wait run detached on a blocking thread, so a child
   stuck in the GPU driver cannot freeze the node. `draining` is visible in `/state` while the
   process exits, and the model is not picked then; with a single copy that is a brief `503`.
-  Pinned models never stop.
+  Pinned models never stop and are never evicted.
+- **Eviction.** A model that does not fit in `free_mb` can take the place of idle models:
+  `loaded`, not pinned, no request in flight, and idle (since it became ready or since its last
+  request) for at least `evict_idle_secs`, 60 s by default, so a chat between two turns is not cut
+  off. Victims are taken oldest first until the model fits. This is not a best fit: a small idle
+  model can go along with the one that really frees the memory. Under the same mutex as `inflight`
+  the node marks the victims `draining`, sends them `SIGKILL` and shows the new model as `loading`
+  with its full `need_mb` charged, so nobody else takes the memory meanwhile; for those few
+  seconds `free_mb` reads lower than it is. The node waits up to 10 s for the victims to exit,
+  runs `--list-devices` on CUDA only after that, and starts the child. A victim stuck in the GPU
+  driver keeps its memory charged until it exits, and the load gets `409`. The price of an
+  eviction is a cold start for the next request to the victim.
 - **Health.** While `loading`, `GET /health` every 5 s. For `loaded` children only process exit is
   checked: llama-server answers `/health` from its HTTP thread and does not notice a hung inference
   loop. A dead child goes back to `available` (`failed` if it died while loading), and the
@@ -283,6 +305,10 @@ that are not obvious from the table:
 - `mem_limit_mb` overrides the `--list-devices` value on every device, with a warning when it is
   above what the GPU reports; on CUDA real free VRAM still caps each load. On a CPU-only build
   llama.cpp reports 0 MiB, and without `mem_limit_mb` the fallback is all physical RAM.
+- `evict_idle_secs` (default 60) is how long a loaded model must sit idle before another model may
+  evict it. A value at or above `idle_timeout_secs` effectively turns eviction off, since the idle
+  timeout unloads the model first. Below 5 s a model can be evicted before the request that loaded
+  it reaches it. The daemon warns about both at startup.
 - `llama_args` is where inventory reads `-c`, `-np`, `-ctk`, `-ctv` for `need_mb` and `slots`.
   `-np` is always passed explicitly. Without it `slots` is unknown.
 - Two daemons on one host need disjoint `child_ports` and separate `data_dir`. A shared

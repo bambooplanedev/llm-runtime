@@ -150,7 +150,7 @@ and model that executed it.
 | A node is visible but never gets requests; the log says `proto N != 2, incompatible` | That node runs another llmrt version. Upgrade all nodes together |
 | The daemon exits with `llama.cpp too old … --tags` | Update llama.cpp on that node (see section 1) |
 | `503 no model of this tier in the cluster` | No model with a parameter count in that tier; check `tiers` in the config |
-| `503 no node can take this model right now` | The model does not fit in free memory anywhere; lower `-c`, unload something, or raise `mem_limit_mb` |
+| `503 no node can take this model right now` | The model does not fit in free memory anywhere, even after evicting idle models: everything else is busy, pinned, or idle for less than `evict_idle_secs`. Lower `-c`, raise `mem_limit_mb`, or retry once a model goes idle |
 | `503 model loading, retry` | A cold start takes longer than `load_wait_secs`; loading continues, retry shortly |
 | `400` with `exceed_context_size_error` | The prompt is longer than the context; raise `-c` in `llama_args` |
 | `502 upstream failed` | `llama-server` crashed while answering; see the daemon log |
