@@ -483,6 +483,8 @@ async fn shutdown_blocks_new_spawns_even_for_pins() {
 #[tokio::test]
 async fn merge_scan_rules() {
     let mut c = cfg();
+    // idle-зупинка з `cfg()` за 1 s змагалась би з перевірками тесту під навантаженням.
+    c.idle_timeout_secs = 30;
     c.child_ports = (7621, 7622);
     let r = Runner::new(
         &c,
