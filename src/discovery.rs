@@ -282,7 +282,8 @@ impl Discovery {
 
     /// Анонс, browse і вічний цикл опитування `/state`. Не повертається.
     pub async fn run(self) {
-        let http = reqwest::Client::builder()
+        // Одна політика для кожного клієнта, що говорить з пірами: напряму, без системного проксі.
+        let http = crate::net::peer_client_builder()
             .timeout(PROBE_TIMEOUT)
             .build()
             .expect("http client");

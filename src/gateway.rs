@@ -825,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_timeout_marks_the_node_dead() {
+    async fn connect_timeout_is_a_connect_failure() {
         let c = crate::net::peer_client_builder()
             .connect_timeout(Duration::from_millis(100))
             .dns_resolver(NeverResolves)

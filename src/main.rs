@@ -87,8 +87,10 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("PATH").unwrap_or_default()
         )
     })?;
-    inventory::check_llama_features(&cfg)?;
+    // Сиріт старішого демона прибираємо навіть якщо ця збірка llama.cpp надто стара
+    // для запуску: `kill_orphans` не потребує `--tags`.
     Runner::kill_orphans(&node_id);
+    inventory::check_llama_features(&cfg)?;
 
     let args = cfg.parse_llama_args();
     // Стартовий скан дає і моделі, і кеш — з ним перескан не перечитує заголовки.

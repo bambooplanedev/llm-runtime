@@ -871,7 +871,7 @@ mod tests {
             "spaces in the model path"
         );
         assert!(!is_orphan(
-            "123 llama serve -m x --alias x --tags llmrt/b2",
+            "123 llama serve -m x --alias x --tags llmrt/other",
             id
         ));
         assert!(

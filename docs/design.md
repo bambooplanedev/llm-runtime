@@ -199,7 +199,7 @@ A node or model failure never becomes a network failure.
 | Node vanished mid-stream | Stream ends with an `upstream_lost` SSE event, log `upstream_lost`; the executing node frees the slot within ~25 s |
 | `/state` silent for 2 s | Miss. Third miss in a row marks dead, then poll every 10 s |
 | `predicted_per_second` fell more than 5× against the first run of this model on this node | Warning in the log, routing unchanged. Metal exceeds its limit by thrashing, not by OOM, and nothing before start can catch it |
-| Different `proto` on one LAN | Nodes see each other, do not talk, warn once a minute |
+| Different `proto` on one LAN | A newer node sees the older one, warns once a minute and sends it nothing; an older node does not see the newer one. Upgrade all nodes together |
 | Empty directory or corrupt GGUF | Node announces without the file, logs it |
 | `llama-server` not found | The only fatal error: exit 1 with the paths searched |
 | llama.cpp returns 4xx (for example `exceed_context_size_error`) | Passed to the client verbatim: status, body, content type |
