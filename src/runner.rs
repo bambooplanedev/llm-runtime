@@ -608,6 +608,18 @@ impl Runner {
         }
     }
 
+    /// Процес вийшов: слот, що досі `Draining`, знову `Available` (`shutdown()` міг уже поставити
+    /// `Available`). Отруєний mutex не має лишити слот у `Draining` назавжди.
+    fn finish_drain(&self, id: &str) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = g.slots.get_mut(id) {
+            if s.model.entry.state == ModelState::Draining {
+                s.model.entry.state = ModelState::Available;
+                s.model.entry.inflight = 0;
+            }
+        }
+    }
+
     /// Під lock-ом: обрати жертв, послати їм SIGKILL, зарезервувати пам'ять під ціль.
     /// `None` — витісненням не влізе. Повертає жертв і їхніх очікувачів.
     ///
@@ -648,13 +660,7 @@ impl Runner {
             let id = v.clone();
             let h = tokio::task::spawn_blocking(move || {
                 let _ = p.child.wait();
-                let mut g = runner.0.lock().unwrap();
-                if let Some(s) = g.slots.get_mut(&id) {
-                    if s.model.entry.state == ModelState::Draining {
-                        s.model.entry.state = ModelState::Available;
-                        s.model.entry.inflight = 0;
-                    }
-                }
+                runner.finish_drain(&id);
             });
             waiters.push((v, h));
         }
@@ -990,13 +996,7 @@ impl Runner {
                                 })
                                 .await;
                                 // Зі стану Draining слот виводить лише ця задача або shutdown().
-                                let mut g = runner.0.lock().unwrap();
-                                if let Some(s) = g.slots.get_mut(&id) {
-                                    if s.model.entry.state == ModelState::Draining {
-                                        s.model.entry.state = ModelState::Available;
-                                        s.model.entry.inflight = 0;
-                                    }
-                                }
+                                runner.finish_drain(&id);
                             });
                         }
                     }

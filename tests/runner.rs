@@ -886,12 +886,12 @@ async fn busy_young_or_pinned_models_are_not_evicted() {
     r.shutdown().await;
 }
 
-/// Поки жертви виходять і йде CUDA-проба (500 ms < fast-tick таймаут 1 s), ціль видно як
+/// Поки жертви виходять і йде CUDA-проба (300 ms < fast-tick таймаут 1 s), ціль видно як
 /// `loading`, і другий запит на неї приєднується, а не витісняє вдруге.
 #[tokio::test]
 async fn eviction_target_is_loading_and_a_second_load_joins() {
     let mut c = evict_cfg((7636, 7637));
-    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=500 {}", fake());
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=300 {}", fake());
     let r = Runner::new(
         &c,
         cuda(1500),
@@ -903,7 +903,7 @@ async fn eviction_target_is_loading_and_a_second_load_joins() {
     wait_loaded(&r, "a").await;
     let r2 = r.clone();
     let first = tokio::spawn(async move { r2.load("b").await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(state_of(&r, "b"), ModelState::Loading, "{:?}", r.snapshot());
     assert!(matches!(
         r.load("b").await,
@@ -945,7 +945,7 @@ async fn cuda_still_short_after_eviction_leaves_target_available() {
 #[tokio::test]
 async fn dropped_load_still_finishes_the_eviction() {
     let mut c = evict_cfg((7639, 7640));
-    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=500 {}", fake());
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=300 {}", fake());
     let r = Runner::new(
         &c,
         cuda(1500),
@@ -955,7 +955,7 @@ async fn dropped_load_still_finishes_the_eviction() {
     let bg = tokio::spawn(r.clone().run_background());
     assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
     wait_loaded(&r, "a").await;
-    let out = tokio::time::timeout(Duration::from_millis(100), r.load("b")).await;
+    let out = tokio::time::timeout(Duration::from_millis(50), r.load("b")).await;
     assert!(
         out.is_err(),
         "the caller must give up mid-eviction: {out:?}"
