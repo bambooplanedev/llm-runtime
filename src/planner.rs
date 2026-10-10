@@ -171,6 +171,7 @@ mod tests {
                     },
                     models,
                     free_mb,
+                    reclaimable_mb: 0,
                     seen: 0,
                 },
             },

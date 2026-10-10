@@ -74,7 +74,7 @@ pub fn router(gw: Gateway) -> Router {
 /// `addr` — те, чим ми ходимо самі до себе; сусід перезапише його адресою,
 /// якою реально достукався (`Discovery::ingest`).
 pub fn local_state(gw: &Gateway) -> NodeState {
-    let (models, free_mb) = gw.runner.snapshot();
+    let (models, free_mb, reclaimable_mb) = gw.runner.node_snapshot();
     NodeState {
         proto: PROTO,
         node_id: gw.node_id.clone(),
@@ -84,6 +84,7 @@ pub fn local_state(gw: &Gateway) -> NodeState {
         hw: gw.hw.clone(),
         models,
         free_mb,
+        reclaimable_mb,
         seen: now_secs(),
     }
 }

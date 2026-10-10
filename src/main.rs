@@ -63,7 +63,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let path = cli.config.or(cli.path);
     let cfg = Arc::new(Config::load(path.as_deref())?);
-    for w in cfg.llama_args_warnings() {
+    for w in cfg
+        .llama_args_warnings()
+        .into_iter()
+        .chain(cfg.evict_warnings())
+    {
         tracing::warn!("{w}");
     }
     std::fs::create_dir_all(&cfg.data_dir)?;

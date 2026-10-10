@@ -48,6 +48,10 @@ pub struct NodeState {
     pub hw: Hw,
     pub models: Vec<ModelEntry>,
     pub free_mb: u64,
+    /// Скільки МБ вузол звільнив би просто зараз, витіснивши моделі, що простоюють.
+    /// Вузол без цього поля читається з 0 — «витісняти нічого».
+    #[serde(default)]
+    pub reclaimable_mb: u64,
     pub seen: u64,
 }
 
@@ -115,5 +119,19 @@ mod tests {
         let s: NodeState = serde_json::from_str(&v1).unwrap();
         assert_eq!(s.proto, 1);
         assert_eq!(s.hw.device_name, "Apple M4");
+    }
+
+    /// Вузол без витіснення не шле `reclaimable_mb`: його стан розбирається з 0, тобто
+    /// «витісняти нічого», і planner поводиться з ним як раніше.
+    #[test]
+    fn state_without_reclaimable_mb_parses_as_zero() {
+        let s: NodeState = serde_json::from_str(EXAMPLE).unwrap();
+        assert_eq!(s.reclaimable_mb, 0);
+        let with = EXAMPLE.replace(
+            "\"free_mb\": 4100",
+            "\"free_mb\": 4100, \"reclaimable_mb\": 6800",
+        );
+        let s: NodeState = serde_json::from_str(&with).unwrap();
+        assert_eq!(s.reclaimable_mb, 6800);
     }
 }

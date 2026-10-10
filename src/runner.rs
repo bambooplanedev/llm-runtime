@@ -100,6 +100,55 @@ pub fn should_idle_stop(
         && now.saturating_duration_since(last_used) > idle
 }
 
+/// Скільки задача витіснення чекає, поки жертви вийдуть, перш ніж відмовитись.
+pub const EVICT_WAIT: Duration = Duration::from_secs(10);
+
+/// Слот очима витіснення: лише те, від чого залежить, чи можна його витіснити.
+#[derive(Debug, Clone)]
+pub struct VictimCand {
+    pub id: String,
+    pub need_mb: u64,
+    pub last_used: Instant,
+    pub state: ModelState,
+    pub inflight: u32,
+    pub pinned: bool,
+}
+
+/// Чи можна витіснити модель просто зараз: завантажена, без запитів, не pinned і простоює
+/// щонайменше `evict_idle`. Між репліками чату `inflight = 0`, тож саме поріг береже розмову.
+pub fn evictable(c: &VictimCand, now: Instant, evict_idle: Duration) -> bool {
+    c.state == ModelState::Loaded
+        && c.inflight == 0
+        && !c.pinned
+        && now.saturating_duration_since(c.last_used) >= evict_idle
+}
+
+/// Найстаріші за `last_used` придатні кандидати (рівність — за `id`), доки `free + Σneed ≥ need`.
+/// Найкоротший префікс у порядку LRU, не best-fit. `None` — витісненням не влізе.
+pub fn pick_victims(
+    cands: &[VictimCand],
+    need: u64,
+    free: u64,
+    now: Instant,
+    evict_idle: Duration,
+) -> Option<Vec<String>> {
+    let mut ok: Vec<&VictimCand> = cands
+        .iter()
+        .filter(|c| evictable(c, now, evict_idle))
+        .collect();
+    ok.sort_by(|a, b| a.last_used.cmp(&b.last_used).then_with(|| a.id.cmp(&b.id)));
+    let mut got = free;
+    let mut out = Vec::new();
+    for c in ok {
+        if got >= need {
+            break;
+        }
+        got = got.saturating_add(c.need_mb);
+        out.push(c.id.clone());
+    }
+    (got >= need).then_some(out)
+}
+
 /// Тести прискорюють такти через `LLMRT_FAST_TICK`.
 fn fast_tick() -> bool {
     std::env::var_os("LLMRT_FAST_TICK").is_some()
@@ -112,6 +161,8 @@ struct Inner {
     child_ports: (u16, u16),
     llama_args: Vec<String>,
     idle: Duration,
+    /// Поріг простою для витіснення (`evict_idle_secs`).
+    evict_idle: Duration,
     pin: Vec<String>,
     node_id: String,
     device: String,
@@ -196,6 +247,32 @@ impl Inner {
         self.mem_limit_mb
             .saturating_sub(self.os_reserve_mb)
             .saturating_sub(self.used_mb())
+    }
+
+    /// Кандидати у жертви — лише слоти з процесом: витіснити можна тільки те, що можна вбити.
+    fn victim_cands(&self) -> Vec<VictimCand> {
+        self.slots
+            .iter()
+            .filter(|(_, s)| s.proc_.is_some())
+            .map(|(id, s)| VictimCand {
+                id: id.clone(),
+                need_mb: s.model.entry.need_mb,
+                last_used: s.last_used,
+                state: s.model.entry.state,
+                inflight: s.model.entry.inflight,
+                pinned: self.pin.iter().any(|p| p == id),
+            })
+            .collect()
+    }
+
+    /// Скільки звільнило б витіснення просто зараз — та сама умова, що в `pick_victims`.
+    fn reclaimable_mb(&self) -> u64 {
+        let now = Instant::now();
+        self.victim_cands()
+            .iter()
+            .filter(|c| evictable(c, now, self.evict_idle))
+            .map(|c| c.need_mb)
+            .sum()
     }
 
     fn free_port(&self) -> Option<u16> {
@@ -340,6 +417,7 @@ impl Runner {
             child_ports: cfg.child_ports,
             llama_args: cfg.llama_args.clone(),
             idle: Duration::from_secs(cfg.idle_timeout_secs),
+            evict_idle: Duration::from_secs(cfg.evict_idle_secs),
             pin: cfg.pin.clone(),
             node_id,
             device: hw.device,
@@ -367,11 +445,17 @@ impl Runner {
         })))
     }
 
-    pub fn snapshot(&self) -> (Vec<ModelEntry>, u64) {
+    /// Моделі, `free_mb` і `reclaimable_mb` — під одним lock-ом, щоб числа були узгоджені.
+    pub fn node_snapshot(&self) -> (Vec<ModelEntry>, u64, u64) {
         let g = self.0.lock().unwrap();
         let mut v: Vec<ModelEntry> = g.slots.values().map(|s| s.model.entry.clone()).collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
-        (v, g.free_mb())
+        (v, g.free_mb(), g.reclaimable_mb())
+    }
+
+    pub fn snapshot(&self) -> (Vec<ModelEntry>, u64) {
+        let (v, free, _) = self.node_snapshot();
+        (v, free)
     }
 
     /// Злиття перескану: що робити зі слотом, коли файл

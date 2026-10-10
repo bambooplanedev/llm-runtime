@@ -1,7 +1,10 @@
 use llmrt::config::Config;
 use llmrt::gguf::GgufMeta;
 use llmrt::inventory::LocalModel;
-use llmrt::runner::{pin_retry_delay, should_idle_stop, ExecTarget, LoadOutcome, PinRetry, Runner};
+use llmrt::runner::{
+    evictable, pick_victims, pin_retry_delay, should_idle_stop, ExecTarget, LoadOutcome, PinRetry,
+    Runner, VictimCand,
+};
 use llmrt::state::{Hw, ModelEntry, ModelState};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -673,6 +676,109 @@ async fn idle_counts_from_loaded_not_from_spawn() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    bg.abort();
+    r.shutdown().await;
+}
+
+fn cand(id: &str, need: u64, age_s: u64, now: Instant) -> VictimCand {
+    VictimCand {
+        id: id.into(),
+        need_mb: need,
+        last_used: now.checked_sub(Duration::from_secs(age_s)).unwrap(),
+        state: ModelState::Loaded,
+        inflight: 0,
+        pinned: false,
+    }
+}
+
+/// Жертви — найстаріші моделі, що простоюють, рівно стільки, щоб влізло (префікс LRU, не best-fit).
+#[test]
+fn victims_are_the_oldest_idle_models_until_it_fits() {
+    let now = Instant::now();
+    let idle = Duration::from_secs(60);
+    let c = vec![
+        cand("young", 4000, 10, now),
+        cand("mid", 2000, 100, now),
+        cand("old", 1000, 300, now),
+    ];
+    let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(pick_victims(&c, 1800, 1000, now, idle), Some(ids(&["old"])));
+    assert_eq!(
+        pick_victims(&c, 2500, 1000, now, idle),
+        Some(ids(&["old", "mid"]))
+    );
+    assert_eq!(
+        pick_victims(&c, 4500, 1000, now, idle),
+        None,
+        "young is idle only 10 s of 60"
+    );
+    assert_eq!(pick_victims(&c, 900, 1000, now, idle), Some(vec![]));
+}
+
+#[test]
+fn busy_pinned_or_not_loaded_models_are_never_victims() {
+    let now = Instant::now();
+    let idle = Duration::from_secs(60);
+    let mut pinned = cand("p", 5000, 300, now);
+    pinned.pinned = true;
+    let mut busy = cand("b", 5000, 300, now);
+    busy.inflight = 1;
+    let mut loading = cand("l", 5000, 300, now);
+    loading.state = ModelState::Loading;
+    let mut draining = cand("d", 5000, 300, now);
+    draining.state = ModelState::Draining;
+    for c in [&pinned, &busy, &loading, &draining] {
+        assert!(!evictable(c, now, idle), "{c:?}");
+    }
+    assert_eq!(
+        pick_victims(&[pinned, busy, loading, draining], 2000, 0, now, idle),
+        None
+    );
+    // Межа порогу включна; з порогом 0 придатна модель, якою щойно користувались.
+    assert!(evictable(&cand("x", 1, 60, now), now, idle));
+    assert!(evictable(&cand("x", 1, 0, now), now, Duration::ZERO));
+}
+
+#[test]
+fn equal_last_used_is_ordered_by_id() {
+    let now = Instant::now();
+    let c = vec![cand("b", 1000, 100, now), cand("a", 1000, 100, now)];
+    assert_eq!(
+        pick_victims(&c, 500, 0, now, Duration::ZERO),
+        Some(vec!["a".to_string()])
+    );
+}
+
+/// `reclaimable_mb` — та сама умова, що й вибір жертв: завантажена модель без запитів рахується,
+/// з запитом у польоті чи молодша за поріг — ні.
+#[tokio::test]
+async fn reclaimable_mb_counts_only_idle_loaded_models() {
+    let mut c = cfg();
+    c.child_ports = (7631, 7631);
+    c.idle_timeout_secs = 30;
+    c.evict_idle_secs = 0;
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert_eq!(r.node_snapshot().2, 0, "nothing loaded yet");
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    assert_eq!(r.node_snapshot().2, 0, "loading is not reclaimable");
+    wait_loaded(&r, "a").await;
+    assert_eq!(r.node_snapshot().2, 1000);
+    let ExecTarget::Ready { guard, .. } = r.exec_target("a") else {
+        panic!()
+    };
+    assert_eq!(r.node_snapshot().2, 0, "a request in flight");
+    drop(guard);
+    assert_eq!(r.node_snapshot().2, 1000);
+    bg.abort();
+    r.shutdown().await;
+
+    c.evict_idle_secs = 30;
+    let r = Runner::new(&c, hw(10_000), vec![lm("a", 1000)], "n1".into());
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    assert_eq!(r.node_snapshot().2, 0, "idle 0 s of 30");
     bg.abort();
     r.shutdown().await;
 }
