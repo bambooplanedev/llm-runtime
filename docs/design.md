@@ -67,9 +67,10 @@ gateway → planner → discovery → inventory. Only gateway knows about HTTP.
   background loop from its first tick, concurrently with discovery, and reloaded after a crash: 5 s
   after a crash that follows at least 5 minutes of stable work, otherwise after `FAILED_COOLDOWN`.
 - **gateway.** One HTTP port. For peers: `GET /state`, `POST /load`, `POST /exec`. For users:
-  `/v1/chat/completions`, `/v1/models`. Calls the planner, proxies the stream, writes the log.
+  `/v1/chat/completions`, `/v1/completions`, `/infill`, `/v1/models`. Calls the planner, proxies the
+  stream, writes the log.
 
-**Planner** is one pure function `pick(cluster, request, exclude) -> Option<(node, model)>`.
+**Planner** is one pure function `pick(cluster, request, exclude, api) -> Option<(node, model)>`.
 Step 2 and the automatic-tier spec change this function and the gateway execute path.
 
 ## 4. State protocol
@@ -90,6 +91,7 @@ One JSON document per node at `GET /state`:
   ],
   "free_mb": 4100,
   "reclaimable_mb": 0,
+  "apis": ["chat", "completions", "infill"],
   "seen": 1757600000
 }
 ```
@@ -122,6 +124,12 @@ One JSON document per node at `GET /state`:
   sum of `need_mb` of `loaded` models that are not pinned, have no request in flight and have been
   idle for at least `evict_idle_secs`. A node without the field reads as `0`, so it simply never
   evicts.
+- **`apis`** lists the client APIs the node serves through `/exec`: `chat`, `completions`,
+  `infill`. A node without the field reads as `["chat"]`, so mixed versions keep working: an older
+  node keeps getting chat and nothing else. Values are strings, so an API a newer node adds does
+  not break parsing; it just matches nothing. For up to one poll (3 s) after a node is downgraded
+  its peers still see the old list, and an infill request may reach its chat child and come back
+  as a `400` from it.
 - **Model `state`**: `available`, `loading`, `loaded`, `draining`, `failed`.
 - **`slots`** is `-np`. `llama-server` queues requests above `-np`, so `inflight` alone does not
   mean busy.
@@ -135,26 +143,35 @@ a concrete id picks the model and the runtime picks only the node; `auto` is a s
 in step 1 and the hook for a future cascade. Tiers by `params_b`: `small < 3`, `medium 3–12`,
 `large > 12`, thresholds in config.
 
-`pick(cluster, request, exclude)`:
+`pick(cluster, request, exclude, api)`:
 
 1. Candidates: pairs (node, model) where the node is alive, `proto` matches, the pair is not in
-   `exclude`, the model is `loaded`, `loading` or `available` and matches the tier or id.
+   `exclude`, the node lists the request's API in `apis`, the model is `loaded`, `loading` or
+   `available` and matches the tier or id.
 2. Drop `available` models whose `need_mb` exceeds the node's `free_mb + reclaimable_mb`. A
    `loading` model is already counted in `free_mb` and is not dropped.
 3. Sort: `loaded`, then `loading` (join a cold start already under way), then `available` that
    fits in `free_mb`, then `available` that fits only after evicting idle models; then more
    `params_b`, then fewer `inflight − slots`. Eviction is a fallback: a model that fits as is
    always wins, even a smaller one.
-4. Empty means `None`. Gateway returns `503` with the reason.
+4. Empty means `None`. Gateway returns `503` with the reason. When the model exists but only on
+   nodes without the API, the reason is `no node with this model supports this endpoint; upgrade
+   llmrt there`.
 
 `params_b` as the second key is the thesis: the best model within the requested effort, never
 above it. Keys after that are heuristics until the logs exist. "GPU before CPU" from an earlier
 revision was removed as a weight without data.
 
+`/v1/completions` and `/infill` go through the same path as chat. `/infill` takes `model` from the
+body, or `infill_model` from the config when the body has none (llama.vscode sends none).
+
 ### Execution
 
 - Gateway calls `POST /exec` on the chosen node. `/exec` does not call `pick`. It goes straight
   to the local child, increments `inflight`, and proxies SSE as is. The local node is no exception.
+  The request carries `api` (`chat` by default); the node maps it to a fixed child path:
+  `/v1/chat/completions`, `/v1/completions` or `/infill`. Any other value gets `404`, so the gateway
+  retries elsewhere.
 - For an `available` or `loading` model gateway first calls `POST /load {model}` with a 30 s
   timeout (on CUDA the node runs `--list-devices` before starting the child). `/load` is
   idempotent and asynchronous: `202` for `available`, `loading`, or `loaded`; `409` when memory is
@@ -190,10 +207,12 @@ revision was removed as a weight without data.
   waits for the system retransmission limit, then counts as a read timeout. Client sockets have
   no `TCP_RXT_CONNDROPTIME` yet. Linux clients are covered by `TCP_USER_TIMEOUT`.
 - A non-2xx answer from the child itself comes back from `/exec` as is, marked with
-  `x-llmrt-origin: child`. Gateway passes a 4xx to the client verbatim, retries a 503 on another
-  pair, and turns any other 5xx into `502 "upstream failed"` with the child's message in the log.
-- `/exec` always adds `stream_options.include_usage = true`. Without it `usage` in the stream is
-  empty.
+  `x-llmrt-origin: child`. Gateway passes a 4xx or a 501 to the client verbatim, retries a 503 on
+  another pair, and turns any other 5xx into `502 "upstream failed"`. Either way the log keeps the
+  first 200 characters of the child's message.
+- Gateway adds `stream_options.include_usage = true` to streaming chat and completions requests.
+  Without it chat streams carry no `usage`. Infill has no such option; its token counts come
+  from `tokens_evaluated` and `tokens_predicted`.
 - Once tokens have reached the client there is no retry. The stream ends with the `upstream_lost` event.
 
 ### Error handling
@@ -211,23 +230,27 @@ A node or model failure never becomes a network failure.
 | `/state` silent for 2 s | Miss. Third miss in a row marks dead, then poll every 10 s |
 | `predicted_per_second` fell more than 5× against the first run of this model on this node | Warning in the log, routing unchanged. Metal exceeds its limit by thrashing, not by OOM, and nothing before start can catch it |
 | Different `proto` on one LAN | A newer node sees the older one, warns once a minute and sends it nothing; an older node does not see the newer one. Upgrade all nodes together |
+| The model is only on nodes that do not serve this API | `503 "no node with this model supports this endpoint; upgrade llmrt there"` |
 | Empty directory or corrupt GGUF | Node announces without the file, logs it |
 | `llama-server` not found | The only fatal error: exit 1 with the paths searched |
-| llama.cpp returns 4xx (for example `exceed_context_size_error`) | Passed to the client verbatim: status, body, content type |
+| llama.cpp returns 4xx (for example `exceed_context_size_error`) or 501 (for example `/infill` on a model without FIM tokens) | Passed to the client verbatim: status, body, content type; the child's message is in the log |
 | llama.cpp returns 503 | Pair excluded, retry `pick` |
 | llama.cpp returns another 5xx | `502 "upstream failed"`, child's message in the log |
 
 Clients see standard codes: `503` (nobody can serve), `502` (executor died), `400` (unknown
-`model`), plus any 4xx that llama.cpp itself returns, such as a prompt longer than the context.
-Any OpenAI SDK works unchanged.
+`model`), plus any 4xx or 501 that llama.cpp itself returns, such as a prompt longer than the
+context. Any OpenAI SDK works unchanged.
 
 ### Request log
 
-One JSON line per request in `<data_dir>/requests.jsonl`: time, requested `model`, chosen node and
-model, active parameters for MoE, cold start flag, `pick` retries, prompt and completion tokens,
-TTFT, generation time, wall-clock, status, error reason. Tokens and timings come from the last SSE
-event (`usage` and `timings` from `llama-server`). Nothing is counted per chunk. This log is the raw
-material for the automatic-tier spec. Without it step 1 is not done.
+One JSON line per request in `<data_dir>/requests.jsonl`: time, requested `model`, the API
+(`chat`, `completions`, `infill`), chosen node and model, active parameters for MoE, cold start
+flag, `pick` retries, prompt and completion tokens, TTFT, generation time, wall-clock, status, error
+reason. Tokens and timings come from the last SSE event that has them: `usage` (chat, completions)
+or `tokens_evaluated` and `tokens_predicted` (infill), plus `timings`. Nothing is counted per chunk.
+TTFT is the first byte from the executor, so for a non-stream request it is close to the whole
+generation. This log is the raw material for the automatic-tier spec. Without it step 1 is not
+done.
 
 ## 6. `llama-server` lifecycle
 
@@ -310,6 +333,8 @@ that are not obvious from the table:
   evict it. A value at or above `idle_timeout_secs` effectively turns eviction off, since the idle
   timeout unloads the model first. Below 5 s a model can be evicted before the request that loaded
   it reaches it. The daemon warns about both at startup.
+- `infill_model` is the model id `/infill` uses when the request has no `model`. It must be an id,
+  not a tier: a tier picks its largest model, and that one may have no FIM tokens.
 - `llama_args` is where inventory reads `-c`, `-np`, `-ctk`, `-ctv` for `need_mb` and `slots`.
   `-np` is always passed explicitly. Without it `slots` is unknown.
 - Two daemons on one host need disjoint `child_ports` and separate `data_dir`. A shared
@@ -333,6 +358,8 @@ build.
 | `usage` in stream | Only with `stream_options.include_usage`, as a separate chunk with empty `choices` | Gateway injects it |
 | Closed socket, non-stream | `cancel task` in the server log within ~1 s, slot released | Closing the upstream connection is enough |
 | hyper on client disconnect | Drops the handler future as soon as the client closes, before the first byte. `inflight` returns to 0 in ~2.7 ms against a 3 s prefill | No need to wait for a failed write |
+| `/v1/completions` (b11429) | OpenAI `text_completion`; the final stream chunk has `usage` and `timings` even without `stream_options`, then `[DONE]` | Same log path as chat; `include_usage` is still injected for other builds |
+| `/infill` (b11429) | Native format, ignores `model`; every stream chunk has `tokens_predicted` and `tokens_evaluated`, the last one `timings`; no `[DONE]` | Tokens come from `tokens_*`; the stream ends when the connection closes |
 
 Not verified: `--list-devices` on CUDA (assumed `CUDA0: <name> (N MiB, M MiB free)`).
 

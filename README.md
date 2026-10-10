@@ -74,6 +74,7 @@ mem_limit_mb = 32768                   # default: from --list-devices; overrides
 | `load_wait_secs` | `120` | How long to wait for a child to become ready |
 | `idle_timeout_secs` | `600` | Unload a model after this much idle time, counted from when it became ready (Loaded) or its last request, whichever is later |
 | `evict_idle_secs` | `60` | A loaded model idle this long may be unloaded to make room for another; `≥ idle_timeout_secs` turns this off |
+| `infill_model` | none | Model id for `/infill` requests that carry no `model` (llama.vscode). A tier is rejected |
 | `tiers` | `{ small = 3.0, medium = 12.0 }` | Tier boundaries in billions of parameters |
 | `pin` | `[]` | Model ids to keep loaded; reloaded after a crash |
 | `data_dir` | `~/.llmrt` | Holds `node_id` and `requests.jsonl` |
@@ -108,13 +109,37 @@ Streaming (`"stream": true`) is supported.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
+| `POST` | `/v1/completions` | OpenAI-compatible text completions |
+| `POST` | `/infill` | llama.cpp fill-in-the-middle, for IDE autocomplete |
 | `GET` | `/v1/models` | Models on all nodes plus the four tier pseudo-models |
 | `GET` | `/state` | This node's inventory and memory (internal, used by peers) |
 | `POST` | `/load`, `/exec` | Internal node-to-node calls |
 
+### IDE autocomplete
+
+Put a FIM-capable model (for example Qwen2.5-Coder) on any node and name it in the config of the
+nodes your editor talks to:
+
+```toml
+infill_model = "qwen2.5-coder-1.5b-q8_0"
+pin = ["qwen2.5-coder-1.5b-q8_0"]   # keep it loaded: otherwise idle stop and eviction turn the next keystroke into a cold start
+```
+
+- **llama.vscode:** set the completion endpoint to `http://<node>:7411` and leave its model field
+  empty (or set it to an llmrt model id). It sends `/infill` without `model`, so llmrt uses
+  `infill_model`.
+- **Continue and other OpenAI clients:** use `http://<node>:7411/v1` as the API base; they call
+  `/v1/completions` with a model id or tier.
+
+A model without FIM tokens answers `/infill` with `501`, which reaches the client as is.
+
+Send these requests to an upgraded node: an older one answers `400 unknown route`. Older nodes in
+the cluster keep serving chat and never get completions or infill. Add `infill_model` only to the
+config of upgraded nodes: an older binary refuses to start with an unknown key.
+
 ### Request log
 
-One JSON line per request (executing node, tokens, TTFT, tokens/s) is appended to
+One JSON line per request (API, executing node, tokens, TTFT, tokens/s) is appended to
 `<data_dir>/requests.jsonl`.
 
 ## Limitations
