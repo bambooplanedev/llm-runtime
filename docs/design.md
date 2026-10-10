@@ -64,8 +64,8 @@ gateway → planner → discovery → inventory. Only gateway knows about HTTP.
   being polled every 10 s, because a node that never restarted will not re-announce itself.
 - **runner.** Manages local `llama-server` children: start on demand, health, stop after idle.
   One process per model. Owns memory accounting and `inflight`. Pinned models are loaded by the
-  background loop from its first tick, concurrently with discovery, and reloaded after a crash at
-  most once per `FAILED_COOLDOWN`.
+  background loop from its first tick, concurrently with discovery, and reloaded after a crash: 5 s
+  after a crash that follows at least 5 minutes of stable work, otherwise after `FAILED_COOLDOWN`.
 - **gateway.** One HTTP port. For peers: `GET /state`, `POST /load`, `POST /exec`. For users:
   `/v1/chat/completions`, `/v1/models`. Calls the planner, proxies the stream, writes the log.
 
@@ -161,13 +161,19 @@ revision was removed as a weight without data.
 - The gateway's HTTP client sets TCP keepalive explicitly (10 s idle, 5 s interval, 3 probes;
   `TCP_USER_TIMEOUT` 25 s on Linux). A peer that vanishes without a reset, for example with Wi-Fi
   off, is dropped in about 25 s on both OSes. Before the first byte the pair is excluded and
-  `pick` retried; after it the stream closes with `upstream_lost`.
+  `pick` retried; after it the stream ends with an SSE `error` event of type `upstream_lost` and
+  no `[DONE]`, the same shape llama.cpp uses for a mid-stream error. Only whole events reach the
+  client, so a break in the middle of a line never leaves half an event. The daemon's listening
+  socket sets the same keepalive and a 25 s limit on unacknowledged data (`TCP_USER_TIMEOUT` on
+  Linux, `TCP_RXT_CONNDROPTIME` on macOS). A node that streams to a vanished peer drops that
+  connection, which closes the child's connection and frees its slot; the node logs `stream
+  dropped by peer`.
 - A non-2xx answer from the child itself comes back from `/exec` as is, marked with
   `x-llmrt-origin: child`. Gateway passes a 4xx to the client verbatim, retries a 503 on another
   pair, and turns any other 5xx into `502 "upstream failed"` with the child's message in the log.
 - `/exec` always adds `stream_options.include_usage = true`. Without it `usage` in the stream is
   empty.
-- Once tokens have reached the client there is no retry. The stream closes with an error.
+- Once tokens have reached the client there is no retry. The stream ends with the `upstream_lost` event.
 
 ### Error handling
 
@@ -179,7 +185,7 @@ A node or model failure never becomes a network failure.
 | Read timeout on `/load` or `/exec` | Pair excluded, retry `pick`, node stays alive |
 | Model loads longer than `load_wait_secs` | `503 "model loading, retry"`, loading continues |
 | Child died before the first byte | `/exec` → `503` with state, pair excluded, retry |
-| Node vanished mid-stream | Stream closes with an error, log `upstream_lost` |
+| Node vanished mid-stream | Stream ends with an `upstream_lost` SSE event, log `upstream_lost`; the executing node frees the slot within ~25 s |
 | `/state` silent for 2 s | Miss. Third miss in a row marks dead, then poll every 10 s |
 | `predicted_per_second` fell more than 5× against the first run of this model on this node | Warning in the log, routing unchanged. Metal exceeds its limit by thrashing, not by OOM, and nothing before start can catch it |
 | Different `proto` on one LAN | Nodes see each other, do not talk, warn once a minute |
@@ -228,8 +234,9 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
 - **Health.** While `loading`, `GET /health` every 5 s. For `loaded` children only process exit is
   checked: llama-server answers `/health` from its HTTP thread and does not notice a hung
   inference loop. A dead child goes back to `available` (`failed` if it died while loading), and
-  the transition is logged as a warning. Pinned models are reloaded by the background loop, at
-  most once per `FAILED_COOLDOWN` after any failed attempt.
+  the transition is logged as a warning. Pinned models are reloaded by the background loop. After
+  a crash that follows at least 5 minutes in `loaded` the next attempt comes 5 s later; after a
+  crash while loading, a crash shortly after loading, or a failed attempt it waits `FAILED_COOLDOWN`.
 - **Rescan.** Every 30 s the daemon rescans `models_dir`. A new or changed file is used only when
   its size and mtime match on two scans in a row, so a file still being copied is not announced.
   A removed file drops its model once no process runs it; a changed file replaces the model once

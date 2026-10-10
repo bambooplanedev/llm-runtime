@@ -1,16 +1,18 @@
 //! Демон `llmrt [PATH | --config PATH]`: конфіг → node_id → probe → сироти →
 //! скан моделей → runner → discovery → лог → gateway (§1–§7).
 
+use axum::serve::ListenerExt;
 use clap::Parser;
 use llmrt::{
     config::Config,
     discovery::Discovery,
     gateway::{router, Gateway},
-    inventory,
+    inventory, net,
     reqlog::ReqLog,
     runner::Runner,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Turn several machines on one LAN into a single OpenAI-compatible inference endpoint.
@@ -113,12 +115,12 @@ async fn main() -> anyhow::Result<()> {
     // посеред довгого prefill, тож легітимні запити не обриваються.
     let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
-        .tcp_keepalive(std::time::Duration::from_secs(10))
-        .tcp_keepalive_interval(std::time::Duration::from_secs(5))
-        .tcp_keepalive_retries(3);
+        .tcp_keepalive(net::KEEPALIVE_IDLE)
+        .tcp_keepalive_interval(net::KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(net::KEEPALIVE_RETRIES);
     // На Linux TCP_USER_TIMEOUT перекриває лічильник проб — ставимо його під ті самі ~25 s.
     #[cfg(target_os = "linux")]
-    let builder = builder.tcp_user_timeout(std::time::Duration::from_secs(25));
+    let builder = builder.tcp_user_timeout(net::UNACKED_TIMEOUT);
     let http = builder.build()?;
     let gw = Gateway {
         cfg: cfg.clone(),
@@ -137,7 +139,18 @@ async fn main() -> anyhow::Result<()> {
             .run_rescan(cfg.models_dir.clone(), args, scanned.cache),
     );
     tokio::spawn(disc.run());
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port)).await?;
+    // Кожне прийняте з'єднання — з keepalive і лімітом непідтверджених даних (B1 §2): інакше
+    // `/exec` у зниклого peer'а тримає слот llama-server до повернення мережі.
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", cfg.port))
+        .await?
+        .tap_io(|s| {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if let Err(e) = net::tune_accepted(s) {
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("cannot set TCP timeouts on accepted sockets: {e}");
+                }
+            }
+        });
     tracing::info!("gateway on :{}", cfg.port);
     // `with_graceful_shutdown` чекає на ВСІ з'єднання в польоті — стрім генерації
     // тримав би його годину. Тому той самий сигнал бачать обидві гілки select!:

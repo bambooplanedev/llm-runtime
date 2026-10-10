@@ -24,6 +24,8 @@ struct Slot {
     pin_last: Option<&'static str>,
     /// Чи вже залоговано «changed on disk, running old file»: раз на зміну, не щоперескан.
     stale_logged: bool,
+    /// Коли слот став `Loaded`; `kill()` рахує з нього, чи була робота стабільною (B1 §3).
+    loaded_since: Option<Instant>,
 }
 
 impl Slot {
@@ -36,6 +38,7 @@ impl Slot {
             pin_retry_at: None,
             pin_last: None,
             stale_logged: false,
+            loaded_since: None,
         }
     }
 }
@@ -53,6 +56,28 @@ pub const RESCAN_EVERY: Duration = Duration::from_secs(30);
 
 /// Повтор завантаження моделі, що впала, — не частіше (spec 2.2). Раз на хвилину — не цикл OOM.
 pub const FAILED_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Pinned-модель, що впала після стабільної роботи, прогрівається знову через стільки (B1 §3).
+pub const PIN_QUICK_RETRY: Duration = Duration::from_secs(5);
+/// «Стабільна робота»: стільки в `Loaded`, щоб крах не вважався циклом «завантажилась → впала».
+pub const PIN_STABLE: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy)]
+pub struct PinRetry {
+    pub quick: Duration,
+    pub stable: Duration,
+    pub cooldown: Duration,
+}
+
+/// Коли знову пробувати pinned-модель після смерті дитини. `next` — стан слота після смерті
+/// (`Failed` — померла в `Loading`, `Available` — у `Loaded`), `loaded_for` — скільки пробула в
+/// `Loaded`. Без запитів модель інакше лишалась би холодною весь cooldown (прогін: 68 s).
+pub fn pin_retry_delay(next: ModelState, loaded_for: Option<Duration>, p: PinRetry) -> Duration {
+    match (next, loaded_for) {
+        (ModelState::Available, Some(d)) if d >= p.stable => p.quick,
+        _ => p.cooldown,
+    }
+}
 
 /// F1: скільки чекати на CUDA-пробу (`--list-devices`), перш ніж уважати драйвер завислим.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -89,6 +114,8 @@ struct Inner {
     device: String,
     cfg: Config,
     failed_cooldown: Duration,
+    /// Затримки повтору pinned-моделі після смерті дитини (B1 §3).
+    pin_retry: PinRetry,
     /// F1: таймаут CUDA-проби; `PROBE_TIMEOUT`, під `LLMRT_FAST_TICK` — 1 s, як `failed_cooldown`.
     probe_timeout: Duration,
     /// `true` once `shutdown()` started (§6): нових дітей більше не запускаємо, навіть pinned.
@@ -239,22 +266,28 @@ impl Inner {
         Ok(())
     }
 
-    fn kill(&mut self, id: &str, next: ModelState) {
+    /// Прибрати мертву дитину. Для pinned-моделі повертає затримку до наступної спроби.
+    fn kill(&mut self, id: &str, next: ModelState) -> Option<Duration> {
         let pinned = self.pin.iter().any(|p| p == id);
-        let cooldown = self.failed_cooldown;
-        if let Some(s) = self.slots.get_mut(id) {
-            if let Some(mut p) = s.proc_.take() {
-                let _ = p.child.kill();
-                let _ = p.child.wait();
-            }
-            s.model.entry.state = next;
-            s.model.entry.inflight = 0;
-            s.failed_at = (next == ModelState::Failed).then(Instant::now);
-            // Pinned-дитина померла: перезапуск — не раніше cooldown, а не на наступному такті.
-            if pinned {
-                s.pin_retry_at = Some(Instant::now() + cooldown);
-            }
+        let pin_retry = self.pin_retry;
+        let s = self.slots.get_mut(id)?;
+        if let Some(mut p) = s.proc_.take() {
+            let _ = p.child.kill();
+            let _ = p.child.wait();
         }
+        s.model.entry.state = next;
+        s.model.entry.inflight = 0;
+        s.failed_at = (next == ModelState::Failed).then(Instant::now);
+        let loaded_for = s.loaded_since.take().map(|t| t.elapsed());
+        if !pinned {
+            return None;
+        }
+        // Після стабільної роботи — швидкий повтор, інакше cooldown: цикл «завантажилась → впала»
+        // не молотить. `pin_last = None` — щоб відновлення знову залогувало `pinned … starting`.
+        let delay = pin_retry_delay(next, loaded_for, pin_retry);
+        s.pin_retry_at = Some(Instant::now() + delay);
+        s.pin_last = None;
+        Some(delay)
     }
 
     /// Перевірки без I/O. `Ok(())` — можна вантажити (spec 1.2: до CUDA-проби і ще раз після).
@@ -303,6 +336,19 @@ impl Runner {
                 Duration::from_secs(1)
             } else {
                 FAILED_COOLDOWN
+            },
+            pin_retry: if fast_tick() {
+                PinRetry {
+                    quick: Duration::from_millis(250),
+                    stable: Duration::from_secs(3),
+                    cooldown: Duration::from_secs(1),
+                }
+            } else {
+                PinRetry {
+                    quick: PIN_QUICK_RETRY,
+                    stable: PIN_STABLE,
+                    cooldown: FAILED_COOLDOWN,
+                }
             },
             probe_timeout: if fast_tick() {
                 Duration::from_secs(1)
@@ -584,8 +630,13 @@ impl Runner {
                     } else {
                         ModelState::Available
                     };
-                    tracing::warn!("{id}: llama-server exited while {st:?} -> {next:?}");
-                    self.0.lock().unwrap().kill(&id, next);
+                    let retry = self.0.lock().unwrap().kill(&id, next);
+                    match retry {
+                        Some(d) => tracing::warn!(
+                            "{id}: llama-server exited while {st:?} -> {next:?}, pinned: retry in {d:?}"
+                        ),
+                        None => tracing::warn!("{id}: llama-server exited while {st:?} -> {next:?}"),
+                    }
                     continue;
                 }
                 match st {
@@ -609,6 +660,7 @@ impl Runner {
                                                     == Some(port) =>
                                         {
                                             s.model.entry.state = ModelState::Loaded;
+                                            s.loaded_since = Some(Instant::now());
                                             true
                                         }
                                         _ => false,
