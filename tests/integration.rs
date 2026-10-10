@@ -1016,7 +1016,7 @@ fn infill_body_over_2_mb_is_accepted() {
         "/infill",
         serde_json::json!({"input_prefix": big, "input_suffix": ""}),
     );
-    assert_eq!(code, 200, "{}", &body[..body.len().min(300)]);
+    assert_eq!(code, 200, "{}", body.chars().take(300).collect::<String>());
 }
 
 /// IDE скасовує non-stream `/infill` посеред prefill на кожне натискання — `inflight` вертається
@@ -1031,7 +1031,7 @@ fn cancelled_infill_returns_inflight() {
         &[("tiny-0.2b.gguf", 2)],
         Opts {
             extra_toml: "infill_model = \"tiny-0.2b\"",
-            envs: &[("FAKE_PREFILL_MS", "3000")],
+            envs: &[("FAKE_PREFILL_MS", "10000")],
             ..Default::default()
         },
     );
@@ -1049,14 +1049,18 @@ fn cancelled_infill_returns_inflight() {
         "/state",
         "warm, inflight 0",
     );
+    // Prefill 10 с: якби скасування не дійшло до дитини, inflight повернувся б у 0 лише
+    // за ~7 с після того, як клієнт здався (10 с мінус 3 с). Тому межа 5 с відрізняє справжнє
+    // скасування від природного завершення prefill.
     // Окремий потік: спершу переконуємось, що inflight став 1, інакше «повернувся в 0» могло б
-    // збігтися з «ще не став 1». 1500 мс з запасом перекриває 200-мілісекундний такт опитування.
-    let h = std::thread::spawn(|| {
+    // збігтися з «ще не став 1». 3000 мс з запасом перекриває 200-мілісекундний такт опитування.
+    let port = a.port;
+    let h = std::thread::spawn(move || {
         reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(1500))
+            .timeout(Duration::from_millis(3000))
             .build()
             .unwrap()
-            .post("http://127.0.0.1:7828/infill")
+            .post(format!("http://127.0.0.1:{port}/infill"))
             .json(&serde_json::json!({"input_prefix": "x", "input_suffix": ""}))
             .send()
             .err()
@@ -1073,11 +1077,17 @@ fn cancelled_infill_returns_inflight() {
         Some(true),
         "client must time out mid-prefill"
     );
+    let gave_up = Instant::now();
     wait_for(
         a.port,
         |v| v["models"][0]["inflight"] == 0,
         "/state",
         "inflight back to 0 after the client gave up",
+    );
+    assert!(
+        gave_up.elapsed() < Duration::from_secs(5),
+        "inflight returned only after {:?}: the child finished, the cancel did not propagate",
+        gave_up.elapsed()
     );
 }
 

@@ -969,6 +969,16 @@ mod tests {
     }
 
     #[test]
+    fn child_error_cuts_by_chars_not_bytes() {
+        let body = "ї".repeat(201);
+        assert_eq!(
+            child_error(501, body.as_bytes()),
+            format!("child 501: {}", "ї".repeat(200))
+        );
+        assert_eq!(child_error(400, b"bad"), "child 400: bad");
+    }
+
+    #[test]
     fn child_errors_pass_through_retry_or_502() {
         // 501 — дитина прямо каже «не вмію» (модель без FIM): інший вузол з тією самою
         // моделлю не допоможе, клієнт має побачити причину.
