@@ -22,6 +22,7 @@ struct Raw {
     load_wait_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
     evict_idle_secs: Option<u64>,
+    infill_model: Option<String>,
     tiers: Option<Tiers>,
     pin: Option<Vec<String>>,
     llama_args: Option<Vec<String>>,
@@ -45,6 +46,8 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     /// Скільки модель має простояти, щоб її могли витіснити заради іншої.
     pub evict_idle_secs: u64,
+    /// Модель для `/infill`, коли клієнт не шле `model` (llama.vscode). Лише id, не тир.
+    pub infill_model: Option<String>,
     pub tiers: Tiers,
     pub pin: Vec<String>,
     pub llama_args: Vec<String>,
@@ -105,6 +108,14 @@ impl Config {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "llmrt".into());
+        let infill_model = match raw.infill_model.map(|s| s.trim().to_ascii_lowercase()) {
+            None => None,
+            Some(s) if s.is_empty() => anyhow::bail!("infill_model must not be empty"),
+            Some(s) if crate::planner::TIER_NAMES.contains(&s.as_str()) => {
+                anyhow::bail!("infill_model must be a model id, not a tier")
+            }
+            Some(s) => Some(s),
+        };
         Ok(Config {
             name: raw.name.unwrap_or(hostname),
             port: raw.port.unwrap_or(7411),
@@ -117,6 +128,7 @@ impl Config {
             load_wait_secs: raw.load_wait_secs.unwrap_or(120),
             idle_timeout_secs: raw.idle_timeout_secs.unwrap_or(600),
             evict_idle_secs: raw.evict_idle_secs.unwrap_or(60),
+            infill_model,
             tiers: raw.tiers.unwrap_or(Tiers {
                 small: 3.0,
                 medium: 12.0,
@@ -274,6 +286,25 @@ mod tests {
         let p = dir.path().join("llmrt.toml");
         std::fs::write(&p, "mem_limit_mb = 24576\n").unwrap();
         assert_eq!(Config::load(Some(&p)).unwrap().mem_limit_mb, Some(24576));
+    }
+
+    /// `infill_model` — id моделі, нормалізований як `model` у запиті. Тир заборонено: він вибирає
+    /// найбільшу модель тиру, а вона може не вміти FIM.
+    #[test]
+    fn infill_model_is_a_normalized_model_id() {
+        assert_eq!(Config::load(None).unwrap().infill_model, None);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("llmrt.toml");
+        std::fs::write(&p, "infill_model = \"  Qwen2.5-Coder-1.5B \"\n").unwrap();
+        assert_eq!(
+            Config::load(Some(&p)).unwrap().infill_model.as_deref(),
+            Some("qwen2.5-coder-1.5b")
+        );
+        for bad in ["\"\"", "\"  \"", "\"small\"", "\"AUTO\""] {
+            std::fs::write(&p, format!("infill_model = {bad}\n")).unwrap();
+            let e = Config::load(Some(&p)).unwrap_err().to_string();
+            assert!(e.contains("infill_model"), "{bad}: {e}");
+        }
     }
 
     #[test]

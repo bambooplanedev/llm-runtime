@@ -187,6 +187,7 @@ mod tests {
                     models,
                     free_mb,
                     reclaimable_mb,
+                    apis: supported_apis(),
                     seen: 0,
                 },
             },

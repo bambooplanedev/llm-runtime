@@ -10,6 +10,8 @@ use std::sync::Mutex;
 pub struct Record {
     pub ts: u64,
     pub requested: String,
+    /// Який клієнтський API: `chat`, `completions`, `infill`.
+    pub api: crate::state::Api,
     pub node_id: String,
     pub model_id: String,
     pub active_params_b: Option<f64>,
@@ -80,15 +82,18 @@ impl ReqLog {
         warned
     }
 
-    /// Витягує `usage` і `timings` з фінального чанка стріму (llama.cpp).
+    /// Витягує токени (`usage` або `tokens_*`) і `timings` з фінального чанка стріму (llama.cpp).
     pub fn fill_from_final_chunk(r: &mut Record, chunk: &serde_json::Value) {
+        // `usage` — chat і completions; `tokens_*` — нативний `/infill` llama.cpp.
         r.prompt_tokens = chunk
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_u64())
+            .or_else(|| chunk.get("tokens_evaluated").and_then(|v| v.as_u64()))
             .or(r.prompt_tokens);
         r.completion_tokens = chunk
             .pointer("/usage/completion_tokens")
             .and_then(|v| v.as_u64())
+            .or_else(|| chunk.get("tokens_predicted").and_then(|v| v.as_u64()))
             .or(r.completion_tokens);
         r.predicted_ms = chunk
             .pointer("/timings/predicted_ms")
@@ -117,6 +122,36 @@ mod tests {
         assert_eq!(r.completion_tokens, Some(5));
         assert_eq!(r.predicted_per_second, Some(20.0));
         assert_eq!(r.predicted_ms, Some(250.0));
+    }
+
+    /// `/infill` llama.cpp не має `usage`: токени — у `tokens_evaluated`/`tokens_predicted`.
+    /// Якщо є обидва варіанти, перемагає `usage`.
+    #[test]
+    fn fills_tokens_from_an_infill_chunk_and_prefers_usage() {
+        let chunk = serde_json::json!({
+            "content": "", "stop": true, "tokens_predicted": 4, "tokens_evaluated": 13,
+            "timings": {"predicted_ms": 16.0, "predicted_per_second": 125.0}
+        });
+        let mut r = Record::default();
+        ReqLog::fill_from_final_chunk(&mut r, &chunk);
+        assert_eq!(r.prompt_tokens, Some(13));
+        assert_eq!(r.completion_tokens, Some(4));
+        assert_eq!(r.predicted_per_second, Some(125.0));
+
+        let both = serde_json::json!({
+            "usage": {"prompt_tokens": 7, "completion_tokens": 5},
+            "tokens_evaluated": 13, "tokens_predicted": 4
+        });
+        let mut r = Record::default();
+        ReqLog::fill_from_final_chunk(&mut r, &both);
+        assert_eq!(r.prompt_tokens, Some(7));
+        assert_eq!(r.completion_tokens, Some(5));
+
+        let r = Record {
+            api: crate::state::Api::Infill,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&r).unwrap()["api"], "infill");
     }
 
     #[test]

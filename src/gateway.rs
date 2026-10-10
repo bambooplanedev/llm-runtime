@@ -91,6 +91,7 @@ pub fn local_state(gw: &Gateway) -> NodeState {
         models,
         free_mb,
         reclaimable_mb,
+        apis: crate::state::supported_apis(),
         seen: now_secs(),
     }
 }

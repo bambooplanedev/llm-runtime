@@ -396,6 +396,7 @@ mod tests {
             models: vec![],
             free_mb: 0,
             reclaimable_mb: 0,
+            apis: supported_apis(),
             seen: 0,
         }
     }
