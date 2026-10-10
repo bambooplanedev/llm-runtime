@@ -91,11 +91,18 @@ pub fn pick(
                 continue;
             }
             // Ранг стану: Loaded, потім Loading (чужий холодний старт уже йде, його пам'ять
-            // вузол уже врахував — free_mb не перевіряємо), потім Available, якщо влазить.
+            // вузол уже врахував — free_mb не перевіряємо), потім Available, якщо влазить сама,
+            // і лише тоді Available, що влізе на місці моделей, які простоюють (вузол їх витіснить).
             let rank = match m.state {
                 ModelState::Loaded => 0u8,
                 ModelState::Loading => 1,
                 ModelState::Available if view.state.free_mb >= m.need_mb => 2,
+                ModelState::Available
+                    if view.state.free_mb.saturating_add(view.state.reclaimable_mb)
+                        >= m.need_mb =>
+                {
+                    3
+                }
                 _ => continue,
             };
             // Менший ключ виграє: (ранг стану, -params_b, inflight - slots)
@@ -152,6 +159,14 @@ mod tests {
         }
     }
     fn node(id: &str, free_mb: u64, models: Vec<ModelEntry>) -> (String, NodeView) {
+        node_r(id, free_mb, 0, models)
+    }
+    fn node_r(
+        id: &str,
+        free_mb: u64,
+        reclaimable_mb: u64,
+        models: Vec<ModelEntry>,
+    ) -> (String, NodeView) {
         (
             id.into(),
             NodeView {
@@ -171,7 +186,7 @@ mod tests {
                     },
                     models,
                     free_mb,
-                    reclaimable_mb: 0,
+                    reclaimable_mb,
                     seen: 0,
                 },
             },
@@ -402,6 +417,67 @@ mod tests {
         assert!(matches!(
             pick(&c, &Want::Model("nope".into()), &tiers(), &HashSet::new()),
             Err(NoPick::UnknownModel)
+        ));
+    }
+
+    /// Витіснення — запасний шлях: модель, що влазить сама, виграє навіть з меншим params_b.
+    #[test]
+    fn fits_as_is_beats_fits_by_eviction() {
+        let c: Cluster = HashMap::from([
+            node_r(
+                "a",
+                1000,
+                8000,
+                vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
+            ),
+            node(
+                "bb",
+                5000,
+                vec![model("m4", 4.0, ModelState::Available, 3000, 0, 1)],
+            ),
+        ]);
+        let medium = Want::Tier(Tier::Medium);
+        let p = pick(&c, &medium, &tiers(), &HashSet::new()).unwrap();
+        assert_eq!(p.pair.model_id, "m4");
+    }
+
+    #[test]
+    fn eviction_candidate_when_nothing_fits_as_is() {
+        let c: Cluster = HashMap::from([node_r(
+            "a",
+            1000,
+            5000,
+            vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
+        )]);
+        let medium = Want::Tier(Tier::Medium);
+        let p = pick(&c, &medium, &tiers(), &HashSet::new()).unwrap();
+        assert_eq!(p.pair.model_id, "m9");
+        assert!(p.cold, "the request starts the load itself");
+        assert!(!p.joined);
+    }
+
+    /// Не влазить і з витісненням, або вузол не оголошує, що можна звільнити, — 503 як раніше.
+    #[test]
+    fn no_eviction_room_is_all_busy() {
+        let medium = Want::Tier(Tier::Medium);
+        let short: Cluster = HashMap::from([node_r(
+            "a",
+            1000,
+            4999,
+            vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
+        )]);
+        assert!(matches!(
+            pick(&short, &medium, &tiers(), &HashSet::new()),
+            Err(NoPick::AllBusy)
+        ));
+        let without_field: Cluster = HashMap::from([node(
+            "a",
+            1000,
+            vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
+        )]);
+        assert!(matches!(
+            pick(&without_field, &medium, &tiers(), &HashSet::new()),
+            Err(NoPick::AllBusy)
         ));
     }
 }
