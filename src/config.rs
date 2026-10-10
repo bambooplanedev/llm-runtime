@@ -21,6 +21,7 @@ struct Raw {
     mem_limit_mb: Option<u64>,
     load_wait_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
+    evict_idle_secs: Option<u64>,
     tiers: Option<Tiers>,
     pin: Option<Vec<String>>,
     llama_args: Option<Vec<String>>,
@@ -42,6 +43,8 @@ pub struct Config {
     pub mem_limit_mb: Option<u64>,
     pub load_wait_secs: u64,
     pub idle_timeout_secs: u64,
+    /// Скільки модель має простояти, щоб її могли витіснити заради іншої.
+    pub evict_idle_secs: u64,
     pub tiers: Tiers,
     pub pin: Vec<String>,
     pub llama_args: Vec<String>,
@@ -113,6 +116,7 @@ impl Config {
             mem_limit_mb: raw.mem_limit_mb,
             load_wait_secs: raw.load_wait_secs.unwrap_or(120),
             idle_timeout_secs: raw.idle_timeout_secs.unwrap_or(600),
+            evict_idle_secs: raw.evict_idle_secs.unwrap_or(60),
             tiers: raw.tiers.unwrap_or(Tiers {
                 small: 3.0,
                 medium: 12.0,
@@ -173,6 +177,27 @@ impl Config {
                     .then(|| format!("llama_args: {flag} is set by llmrt itself; remove it"))
             })
             .collect()
+    }
+
+    /// Значення `evict_idle_secs`, які навряд чи задумані. Idle-зупинка спрацьовує за `>` раз на
+    /// такт, витіснення — за `≥`, тож за рівних значень вікно в такт лишається: «effectively».
+    pub fn evict_warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.evict_idle_secs >= self.idle_timeout_secs {
+            w.push(format!(
+                "evict_idle_secs ({}) >= idle_timeout_secs ({}): idle models are unloaded by the \
+                 idle timeout first, eviction is effectively off",
+                self.evict_idle_secs, self.idle_timeout_secs
+            ));
+        }
+        if self.evict_idle_secs < 5 {
+            w.push(format!(
+                "evict_idle_secs ({}) < 5: a model can be evicted before the request that loaded \
+                 it reaches it",
+                self.evict_idle_secs
+            ));
+        }
+        w
     }
 }
 
@@ -249,5 +274,27 @@ mod tests {
         let p = dir.path().join("llmrt.toml");
         std::fs::write(&p, "mem_limit_mb = 24576\n").unwrap();
         assert_eq!(Config::load(Some(&p)).unwrap().mem_limit_mb, Some(24576));
+    }
+
+    #[test]
+    fn evict_idle_secs_default_toml_and_warnings() {
+        let c = Config::load(None).unwrap();
+        assert_eq!(c.evict_idle_secs, 60);
+        assert!(c.evict_warnings().is_empty(), "{:?}", c.evict_warnings());
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("llmrt.toml");
+        std::fs::write(&p, "evict_idle_secs = 600\nidle_timeout_secs = 600\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.evict_idle_secs, 600);
+        let w = c.evict_warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("effectively off"), "{w:?}");
+
+        let mut c = Config::load(None).unwrap();
+        c.evict_idle_secs = 1;
+        let w = c.evict_warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("< 5"), "{w:?}");
     }
 }

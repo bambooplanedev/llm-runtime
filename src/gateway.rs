@@ -37,6 +37,12 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
 // таймаут запиту довший за connect-таймаут: інакше першим спрацює він, і це буде просто timeout.
 const _: () = assert!(LOAD_TIMEOUT.as_secs() > crate::net::CONNECT_TIMEOUT.as_secs());
 const _: () = assert!(EXEC_TIMEOUT.as_secs() > crate::net::CONNECT_TIMEOUT.as_secs());
+// `/load` з витісненням: жертви виходять (≤ EVICT_WAIT), потім CUDA-проба (≤ PROBE_TIMEOUT) —
+// разом мусить бути коротше за таймаут виклику, інакше gateway здасться раніше за вузол.
+const _: () = assert!(
+    crate::runner::EVICT_WAIT.as_secs() + crate::runner::PROBE_TIMEOUT.as_secs()
+        < LOAD_TIMEOUT.as_secs()
+);
 
 /// Максимум два повтори `pick`.
 const MAX_RETRIES: u32 = 2;
@@ -74,7 +80,7 @@ pub fn router(gw: Gateway) -> Router {
 /// `addr` — те, чим ми ходимо самі до себе; сусід перезапише його адресою,
 /// якою реально достукався (`Discovery::ingest`).
 pub fn local_state(gw: &Gateway) -> NodeState {
-    let (models, free_mb) = gw.runner.snapshot();
+    let (models, free_mb, reclaimable_mb) = gw.runner.node_snapshot();
     NodeState {
         proto: PROTO,
         node_id: gw.node_id.clone(),
@@ -84,6 +90,7 @@ pub fn local_state(gw: &Gateway) -> NodeState {
         hw: gw.hw.clone(),
         models,
         free_mb,
+        reclaimable_mb,
         seen: now_secs(),
     }
 }

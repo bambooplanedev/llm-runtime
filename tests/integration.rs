@@ -77,6 +77,18 @@ fn gguf(dir: &std::path::Path, name: &str, layers: u32) {
     assert!(st.success());
 }
 
+/// GGUF із реальним розміром файлу: після заголовка й tensor-info дописується `pad_mb` MiB нулів — need_mb ≈ pad + kv + 512.
+fn padded_gguf(dir: &std::path::Path, name: &str, pad_mb: u32) {
+    let st = Command::new("python3")
+        .arg("tests/fixtures/make_gguf.py")
+        .arg(dir.join(name))
+        .args(["--layers", "2", "--pad-mb", &pad_mb.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
 /// Налаштування демона поверх базового конфігу. `envs` отримує демон, а через
 /// успадкування — і його діти-фейки (`FAKE_LOAD_MS`, `FAKE_CHAT_STATUS`, …).
 struct Opts<'a> {
@@ -432,14 +444,7 @@ fn load_409_when_memory_full_and_orphan_with_other_node_id_untouched() {
     let mdir = dir.path().join("models");
     std::fs::create_dir_all(&mdir).unwrap();
     for n in ["p-1b.gguf", "q-1b.gguf"] {
-        let st = Command::new("python3")
-            .arg("tests/fixtures/make_gguf.py")
-            .arg(mdir.join(n))
-            .args(["--layers", "2", "--pad-mb", "100"])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(st.success());
+        padded_gguf(&mdir, n, 100);
     }
     std::fs::write(
         dir.path().join("llmrt.toml"),
@@ -1065,4 +1070,74 @@ fn exec_stream_dropped_mid_generation_is_logged_and_frees_inflight() {
         assert!(Instant::now() < deadline, "no drop log line:\n{text}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Вузол із пам'яттю на одну модель: запит на другу витісняє першу, що простоює, замість 503.
+#[test]
+fn idle_model_is_evicted_for_a_model_that_does_not_fit_beside_it() {
+    let _s = serial();
+    // FAKE_MEM_MB=700, дві моделі по 100 MB → need ≈ 100 + kv(4) + 512 = 616; дві не влазять.
+    let dir = tempfile::tempdir().unwrap();
+    let mdir = dir.path().join("models");
+    std::fs::create_dir_all(&mdir).unwrap();
+    for n in ["p-1b.gguf", "q-1b.gguf"] {
+        padded_gguf(&mdir, n, 100);
+    }
+    std::fs::write(
+        dir.path().join("llmrt.toml"),
+        format!(
+            r#"
+port = 7800
+child_ports = "7812-7815"
+models_dir = "{}"
+llama_server = "{}"
+os_reserve_mb = 0
+evict_idle_secs = 0
+data_dir = "{}"
+llama_args = ["-c", "512"]
+"#,
+            mdir.display(),
+            env!("CARGO_BIN_EXE_fake-llama-server"),
+            dir.path().join("data").display()
+        ),
+    )
+    .unwrap();
+    let _node = Node {
+        _proc: Proc(
+            Command::new(env!("CARGO_BIN_EXE_llmrt"))
+                .arg(dir.path().join("llmrt.toml"))
+                .env("LLMRT_FAST_TICK", "1")
+                .env("FAKE_MEM_MB", "700")
+                .stdout(logs())
+                .stderr(logs())
+                .spawn()
+                .unwrap(),
+        ),
+        port: 7800,
+        dir,
+    };
+    node_up(7800, 2);
+
+    let (st, body) = chat(7800, "p-1b", false);
+    assert_eq!(st, 200, "{body}");
+    wait_for(
+        7800,
+        |v| v["reclaimable_mb"].as_u64().unwrap_or(0) > 0,
+        "/state",
+        "idle p-1b advertised as reclaimable",
+    );
+    let (st, body) = chat(7800, "q-1b", false);
+    assert_eq!(st, 200, "the idle p-1b must make room: {body}");
+    let s = get(7800, "/state");
+    let state = |id: &str| {
+        s["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()["state"]
+            .clone()
+    };
+    assert_eq!(state("p-1b"), "available", "{s}");
+    assert_eq!(state("q-1b"), "loaded", "{s}");
 }

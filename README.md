@@ -24,10 +24,11 @@ Design doc: [docs/design.md](docs/design.md).
   node picks the best (node, model) pair across the cluster and proxies the request there.
 - Tiers are by parameter count, default `small < 3B`, `3B ≤ medium ≤ 12B`, `large > 12B`.
   `auto` currently maps to `small`.
-- Selection order: an already loaded model beats a cold one, then more parameters, then fewer
-  in-flight requests.
+- Selection order: an already loaded model beats a cold one, a cold one that fits beats one that
+  fits only after evicting idle models, then more parameters, then fewer in-flight requests.
 - Cold models are started on demand as a `llama-server` child process and stopped after an idle
-  timeout. If a model does not fit in free memory, the request gets `503`.
+  timeout. If a model does not fit in free memory, the node first evicts loaded models that have
+  been idle for at least `evict_idle_secs`; if that cannot make room, the request gets `503`.
 
 ## Requirements
 
@@ -72,6 +73,7 @@ mem_limit_mb = 32768                   # default: from --list-devices; overrides
 | `mem_limit_mb` | from `--list-devices` | Memory cap for loaded models; overrides the device value |
 | `load_wait_secs` | `120` | How long to wait for a child to become ready |
 | `idle_timeout_secs` | `600` | Unload a model after this much idle time, counted from when it became ready (Loaded) or its last request, whichever is later |
+| `evict_idle_secs` | `60` | A loaded model idle this long may be unloaded to make room for another; `≥ idle_timeout_secs` turns this off |
 | `tiers` | `{ small = 3.0, medium = 12.0 }` | Tier boundaries in billions of parameters |
 | `pin` | `[]` | Model ids to keep loaded; reloaded after a crash |
 | `data_dir` | `~/.llmrt` | Holds `node_id` and `requests.jsonl` |
@@ -132,7 +134,6 @@ One JSON line per request (executing node, tokens, TTFT, tokens/s) is appended t
 - **Downloading models or llama.cpp.** The operator installs both.
 - **Working over the internet or a VPN.** One LAN only.
 - **Authentication or encryption.** See Limitations.
-- **Evicting models.** A model that does not fit gets `503`. The idle timeout frees memory.
 - **Restarting crashed children on the spot.** A crashed model goes back to available and the next
   request reloads it. A model that failed to load waits a 60 s cooldown. Pinned models are
   reloaded automatically.
