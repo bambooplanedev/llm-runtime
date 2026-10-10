@@ -233,8 +233,12 @@ impl Inner {
             .arg(port.to_string())
             .arg("--host")
             .arg("127.0.0.1")
+            // `--alias` — те, що клієнт бачить у `model` відповіді; `--tags` — маркер сиріт
+            // для `kill_orphans` (llama.cpp його лише показує, на маршрутизацію не впливає).
             .arg("--alias")
-            .arg(format!("llmrt/{}/{}", self.node_id, id))
+            .arg(id)
+            .arg("--tags")
+            .arg(format!("llmrt/{}", self.node_id))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         #[cfg(target_os = "linux")]
@@ -784,12 +788,15 @@ impl Runner {
 
     /// macOS has no PDEATHSIG, so on boot we kill processes carrying our argv marker.
     pub fn kill_orphans(node_id: &str) {
-        let marker = format!("--alias llmrt/{node_id}/");
-        let Ok(out) = Command::new("ps").args(["-axo", "pid=,command="]).output() else {
+        // `ww`: procps на Linux інакше обрізає рядок, а маркер — останній аргумент.
+        let Ok(out) = Command::new("ps")
+            .args(["-axww", "-o", "pid=,command="])
+            .output()
+        else {
             return;
         };
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if line.contains(&marker) {
+            if is_orphan(line, node_id) {
                 if let Some(pid) = line
                     .split_whitespace()
                     .next()
@@ -827,5 +834,51 @@ impl Runner {
             }
         })
         .await;
+    }
+}
+
+/// Рядок `ps` — наша дитина: сусідні токени `--tags llmrt/<node_id>` (точний збіг, тож
+/// інший id з тим самим префіксом не зачепить, а пробіли в шляху моделі не заважають),
+/// або старий маркер `--alias llmrt/<node_id>/`, яким позначали дітей демони протоколу 1.
+/// Старий маркер прибрати, коли не лишиться демонів протоколу 1.
+fn is_orphan(line: &str, node_id: &str) -> bool {
+    let tag = format!("llmrt/{node_id}");
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    toks.windows(2).any(|w| w[0] == "--tags" && w[1] == tag)
+        || line.contains(&format!("--alias llmrt/{node_id}/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_orphan;
+
+    #[test]
+    fn orphan_marker_matches_only_our_node() {
+        let id = "a1";
+        assert!(is_orphan(
+            "123 llama serve -m /m/x.gguf --port 7500 --alias x --tags llmrt/a1",
+            id
+        ));
+        assert!(
+            is_orphan("123 llama-server -m /m/x.gguf --alias llmrt/a1/x -np 1", id),
+            "marker of a protocol-1 daemon"
+        );
+        assert!(
+            is_orphan(
+                "123 llama serve -m /Users/me/My Models/x.gguf --alias x --tags llmrt/a1",
+                id
+            ),
+            "spaces in the model path"
+        );
+        assert!(!is_orphan(
+            "123 llama serve -m x --alias x --tags llmrt/other",
+            id
+        ));
+        assert!(
+            !is_orphan("123 llama serve -m x --alias x --tags llmrt/a12", id),
+            "our id is a prefix of theirs"
+        );
+        assert!(!is_orphan("123 llama-server -m x --alias llmrt/a12/x", id));
+        assert!(!is_orphan("456 vim notes/llmrt/a1", id));
     }
 }

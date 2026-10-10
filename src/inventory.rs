@@ -205,8 +205,8 @@ const GPU_PREFIXES: [&str; 5] = ["MTL", "CUDA", "Vulkan", "ROCm", "HIP"];
 /// без GPU — перший рядок з ненульовим total (CPU-збірка).
 pub fn parse_list_devices(out: &str) -> Hw {
     let mut hw = Hw {
-        cpu: String::new(),
         device: "CPU".into(),
+        device_name: String::new(),
         mem_limit_mb: 0,
     };
     for line in out.lines() {
@@ -232,7 +232,7 @@ pub fn parse_list_devices(out: &str) -> Hw {
         if is_gpu || (hw.mem_limit_mb == 0 && total > 0) {
             hw.device = name.trim().to_string();
             hw.mem_limit_mb = total; // для MTL це робочий набір Metal, не RAM
-            hw.cpu = rest[..open].trim().to_string();
+            hw.device_name = rest[..open].trim().to_string();
             if is_gpu {
                 break;
             }
@@ -327,6 +327,30 @@ pub fn probe_hw(cfg: &Config) -> anyhow::Result<Hw> {
         };
     }
     Ok(hw)
+}
+
+/// Маркер сиріт — `--tags`, якого старі збірки llama.cpp не знають: з ними падав би кожен
+/// старт дитини (невідомий аргумент), і модель крутилася б через failed і cooldown.
+pub fn help_has_tags(help: &str) -> bool {
+    help.contains("--tags")
+}
+
+/// Разом із `probe_hw` — друга перевірка llama.cpp на старті: без `--tags` демон не стартує.
+pub fn check_llama_features(cfg: &Config) -> anyhow::Result<()> {
+    let out = cfg.llama_cmd().arg("--help").output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if help_has_tags(&text) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "llama.cpp too old: `{} --help` has no --tags (need a build with it, verified on b11046)",
+            cfg.llama_server
+        )
+    }
 }
 
 pub fn parse_free_mb(out: &str) -> Option<u64> {
@@ -574,13 +598,16 @@ mod tests {
         let rocm = "Available devices:\n  ROCm0: AMD Radeon RX 7900 XTX (RADV NAVI31) (24560 MiB, 24000 MiB free)\n";
         let hw = parse_list_devices(rocm);
         assert_eq!(hw.device, "ROCm0");
-        assert_eq!(hw.cpu, "AMD Radeon RX 7900 XTX (RADV NAVI31)");
+        assert_eq!(hw.device_name, "AMD Radeon RX 7900 XTX (RADV NAVI31)");
         assert_eq!(hw.mem_limit_mb, 24560);
         assert_eq!(parse_free_mb(rocm), Some(24000));
         assert_eq!(default_os_reserve(&hw), 1024);
         let vk = "  Vulkan0: Intel(R) Arc(TM) A770 Graphics (8128 MiB, 8000 MiB free)\n";
         assert_eq!(parse_list_devices(vk).mem_limit_mb, 8128);
-        assert_eq!(parse_list_devices(vk).cpu, "Intel(R) Arc(TM) A770 Graphics");
+        assert_eq!(
+            parse_list_devices(vk).device_name,
+            "Intel(R) Arc(TM) A770 Graphics"
+        );
         // ')' перед '(' — не паніка, а пропуск рядка
         let bad = "X: broken ) foo ( bar\nY: also ) broken ( free\n";
         assert_eq!(parse_list_devices(bad).mem_limit_mb, 0);
@@ -605,7 +632,7 @@ mod tests {
         let out = "Available devices:\n  MTL0: Apple M4 (12124 MiB, 12123 MiB free)\n  BLAS: Accelerate (0 MiB, 0 MiB free)\n";
         let hw = parse_list_devices(out);
         assert_eq!(hw.device, "MTL0");
-        assert_eq!(hw.cpu, "Apple M4");
+        assert_eq!(hw.device_name, "Apple M4");
         assert_eq!(hw.mem_limit_mb, 12124);
         assert_eq!(default_os_reserve(&hw), 2048);
         assert_eq!(parse_free_mb(out), Some(12123));
@@ -676,6 +703,17 @@ mod tests {
         assert!(!ids(&s3).contains(&"a-1b".to_string()) && s3.keep.contains("a-1b"));
 
         assert!(scan_dir(&dir.path().join("missing"), &a, None).is_err());
+    }
+
+    #[test]
+    fn help_must_list_tags() {
+        // Рядки з `llama serve --help`, llama.cpp b11046
+        let b11046 = "-a,    --alias STRING                   set model name aliases, comma-separated (to be used by API)\n\
+                      --tags STRING                           set model tags, comma-separated (informational, not used for routing)\n";
+        assert!(help_has_tags(b11046));
+        assert!(!help_has_tags(
+            "-a,    --alias STRING   set alias for model name (to be used by REST API)\n"
+        ));
     }
 
     #[test]

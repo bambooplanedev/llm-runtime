@@ -161,6 +161,19 @@ impl Config {
         }
         a
     }
+
+    /// `--alias` (що клієнт бачить у `model`) і `--tags` (маркер сиріт) llmrt ставить сам.
+    /// Не в `parse_llama_args`: той викликається на кожен старт дитини.
+    pub fn llama_args_warnings(&self) -> Vec<String> {
+        self.llama_args
+            .iter()
+            .filter_map(|a| {
+                let flag = a.split_once('=').map_or(a.as_str(), |(k, _)| k);
+                matches!(flag, "-a" | "--alias" | "--tags")
+                    .then(|| format!("llama_args: {flag} is set by llmrt itself; remove it"))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +225,21 @@ mod tests {
         let c = Config::load(Some(&p)).unwrap();
         assert_eq!(c.child_ports, (8000, 8003));
         assert_eq!(c.port, 7000);
+    }
+
+    #[test]
+    fn llama_args_that_llmrt_sets_itself_warn() {
+        let mut c = Config::load(None).unwrap();
+        c.llama_args = ["-c", "4096", "-a", "x", "--alias=y", "--tags", "t"]
+            .map(String::from)
+            .to_vec();
+        let w = c.llama_args_warnings();
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains(" -a "), "{w:?}");
+        assert!(w[1].contains(" --alias "), "{w:?}");
+        assert!(w[2].contains(" --tags "), "{w:?}");
+        c.llama_args = ["-c", "4096", "-np", "2"].map(String::from).to_vec();
+        assert!(c.llama_args_warnings().is_empty());
     }
 
     #[test]

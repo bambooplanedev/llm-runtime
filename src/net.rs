@@ -1,5 +1,5 @@
-//! TCP-таймаути для з'єднань, які приймає gateway, і ті самі значення для клієнта
-//! reqwest: peer, що зник без RST, виявляється за ~25 s в обидва боки.
+//! TCP-таймаути для з'єднань, які приймає gateway, і клієнт до сусідів з тими самими
+//! значеннями: peer, що зник без RST, виявляється за ~25 s в обидва боки.
 
 use std::time::Duration;
 
@@ -9,6 +9,40 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const KEEPALIVE_RETRIES: u32 = 3;
 /// Скільки чекати ACK на вже надіслані дані: при непідтверджених даних keepalive не діє.
 pub const UNACKED_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Connect до сусіда. Кожен запит gateway, чию помилку класифікуємо, має власний `.timeout()`,
+/// довший за цей: лише тоді збій connect приходить як помилка connect, а не як загальний таймаут.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Клієнт до сусідів (і до себе через loopback). Без глобального таймауту: генерація триває
+/// скільки треба, і кожен виклик ставить власний. Keepalive — явно: дефолти reqwest 0.13.5
+/// (15 s / 15 s / 3, на Linux ще TCP_USER_TIMEOUT 30 s) дають ~60 s на macOS і ~30 s на Linux
+/// до виявлення вузла, що зник без RST (вимкнений Wi-Fi). Тут ~25 s на обох. Живий вузол
+/// підтверджує проби ядром навіть посеред довгого prefill, тож легітимні запити не обриваються.
+/// Проксі не беремо: сусіди — в LAN, а системний проксі (`HTTP_PROXY`, macOS) увів би трафік
+/// у чужий хост, і помилки connect описували б проксі. Повертає builder, щоб тест міг
+/// підставити свій DNS-резолвер.
+pub fn peer_client_builder() -> reqwest::ClientBuilder {
+    with_unacked_timeout(
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .no_proxy()
+            .tcp_keepalive(KEEPALIVE_IDLE)
+            .tcp_keepalive_interval(KEEPALIVE_INTERVAL)
+            .tcp_keepalive_retries(KEEPALIVE_RETRIES),
+    )
+}
+
+/// На Linux TCP_USER_TIMEOUT перекриває лічильник проб — ставимо його під ті самі ~25 s.
+#[cfg(target_os = "linux")]
+fn with_unacked_timeout(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    b.tcp_user_timeout(UNACKED_TIMEOUT)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_unacked_timeout(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    b
+}
 
 /// Без цього вузол, що шле стрім зниклому peer'у, дізнається про це через ~15 хв ретрансмітів
 /// (або коли мережа повернеться) — і весь цей час тримає слот llama-server. Linux:

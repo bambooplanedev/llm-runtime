@@ -165,8 +165,8 @@ mod tests {
                     addr: format!("10.0.0.{}:7411", id.len()),
                     version: "0.1.0".into(),
                     hw: Hw {
-                        cpu: "".into(),
                         device: "CPU".into(),
+                        device_name: "".into(),
                         mem_limit_mb: 0,
                     },
                     models,

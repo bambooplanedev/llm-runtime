@@ -62,8 +62,8 @@ fn lm(id: &str, need: u64) -> LocalModel {
 
 fn hw(limit: u64) -> Hw {
     Hw {
-        cpu: "x".into(),
         device: "CPU".into(),
+        device_name: "x".into(),
         mem_limit_mb: limit,
     }
 }
@@ -259,8 +259,8 @@ async fn cuda_probe_runs_only_after_cheap_checks() {
         fake()
     );
     let cuda = Hw {
-        cpu: "x".into(),
         device: "CUDA0".into(),
+        device_name: "x".into(),
         mem_limit_mb: 1500,
     };
     let r = Runner::new(&c, cuda, vec![lm("big", 5000), lm("a", 1000)], "n1".into());
@@ -285,8 +285,8 @@ async fn cuda_reported_free_is_not_reduced_by_os_reserve() {
     c.os_reserve_mb = Some(1024);
     c.llama_server = format!("env FAKE_MEM_MB=7285 {}", fake());
     let cuda = Hw {
-        cpu: "x".into(),
         device: "CUDA0".into(),
+        device_name: "x".into(),
         mem_limit_mb: 7863,
     };
     let r = Runner::new(&c, cuda, vec![lm("a", 6441)], "n1".into());
@@ -306,8 +306,8 @@ async fn cuda_reported_free_still_caps_load() {
     c.os_reserve_mb = Some(1024);
     c.llama_server = format!("env FAKE_MEM_MB=6400 {}", fake());
     let cuda = Hw {
-        cpu: "x".into(),
         device: "CUDA0".into(),
+        device_name: "x".into(),
         mem_limit_mb: 7863,
     };
     let r = Runner::new(&c, cuda, vec![lm("a", 6441)], "n1".into());
@@ -323,8 +323,8 @@ async fn cuda_probe_timeout_returns_spawn_failed() {
     c.child_ports = (7623, 7623);
     c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=20000 {}", fake());
     let cuda = Hw {
-        cpu: "x".into(),
         device: "CUDA0".into(),
+        device_name: "x".into(),
         mem_limit_mb: 10_000,
     };
     let r = Runner::new(&c, cuda, vec![lm("a", 1000)], "n1".into());
@@ -421,8 +421,8 @@ async fn pinned_that_does_not_fit_backs_off() {
         fake()
     );
     let cuda = Hw {
-        cpu: "x".into(),
         device: "CUDA0".into(),
+        device_name: "x".into(),
         mem_limit_mb: 10_000,
     };
     let r = Runner::new(&c, cuda, vec![lm("a", 1000)], "n1".into());

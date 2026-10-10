@@ -1,7 +1,7 @@
-//! Test double for `llama serve` (llama.cpp b10826).
+//! Test double for `llama serve` (llama.cpp b10826; `--tags` since b11046).
 //!
 //! Mirrors exactly what the runner and gateway rely on: `--list-devices`, `--help`,
-//! `-m/--port/--host/--alias/-c/-np`, `/health` with a loading phase, `/props`,
+//! `-m/--port/--host/--alias/--tags/-c/-np`, `/health` with a loading phase, `/props`,
 //! `/v1/models` and `/v1/chat/completions` with SSE `usage`+`timings`.
 //!
 //! Env knobs (tests drive these):
@@ -17,6 +17,7 @@
 //! - `FAKE_LIST_DEVICES_SLEEP_MS` — sleep this long in the `--list-devices` branch before printing
 //!   (after the log line above), to simulate a wedged driver.
 //! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
+//! - `FAKE_NO_TAGS=1`       — `--help` omits `--tags`, as an llama.cpp build too old for llmrt.
 
 use axum::{
     extract::State,
@@ -87,6 +88,10 @@ async fn main() {
     }
     if args.iter().any(|a| a == "--help") {
         println!("-fit,  --fit [on|off]   default: 'on'\n-a,    --alias STRING");
+        // FAKE_NO_TAGS: a build too old for llmrt, whose `--help` has no `--tags`.
+        if std::env::var_os("FAKE_NO_TAGS").is_none() {
+            println!("--tags STRING");
+        }
         return;
     }
     let env = |k: &str, d: u64| {

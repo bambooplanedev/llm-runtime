@@ -32,6 +32,12 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(2);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Генерація може тривати довго; це запобіжник, а не бюджет.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
+
+// Connect-timeout приходить як помилка connect (→ вузол dead) лише тоді, коли загальний
+// таймаут запиту довший за connect-таймаут: інакше першим спрацює він, і це буде просто timeout.
+const _: () = assert!(LOAD_TIMEOUT.as_secs() > crate::net::CONNECT_TIMEOUT.as_secs());
+const _: () = assert!(EXEC_TIMEOUT.as_secs() > crate::net::CONNECT_TIMEOUT.as_secs());
+
 /// Максимум два повтори `pick`.
 const MAX_RETRIES: u32 = 2;
 /// Ліміт тіла запиту: довгий промпт легко перебиває дефолтні 2 МБ axum.
@@ -259,7 +265,8 @@ pub fn prepare_upstream_body(body: &mut serde_json::Value, model_id: &str) {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpstreamErr {
-    ConnectRefused,
+    /// Connect не вдався: refused, unreachable, connect-timeout, DNS.
+    Connect,
     Timeout,
     Status(u16),
 }
@@ -329,7 +336,7 @@ async fn pass_through(
 
 pub fn classify(e: UpstreamErr) -> Retry {
     match e {
-        UpstreamErr::ConnectRefused => Retry::MarkDeadAndRetry,
+        UpstreamErr::Connect => Retry::MarkDeadAndRetry,
         // 404 — сусід не знає цієї моделі: наш знімок застарів, шукаємо іншого.
         UpstreamErr::Timeout
         | UpstreamErr::Status(404)
@@ -339,14 +346,34 @@ pub fn classify(e: UpstreamErr) -> Retry {
     }
 }
 
-fn upstream_err(e: &reqwest::Error) -> UpstreamErr {
-    if e.is_timeout() {
+/// Спершу connect: connect-timeout — водночас і timeout, а вузол, до якого не
+/// під'єднатися, треба позначити dead одразу, а не після трьох пропусків discovery.
+pub fn upstream_kind(connect: bool, timeout: bool) -> UpstreamErr {
+    if connect {
+        UpstreamErr::Connect
+    } else if timeout {
         UpstreamErr::Timeout
-    } else if e.is_connect() {
-        UpstreamErr::ConnectRefused
     } else {
         UpstreamErr::Status(502)
     }
+}
+
+fn upstream_err(e: &reqwest::Error) -> UpstreamErr {
+    upstream_kind(e.is_connect(), e.is_timeout())
+}
+
+/// Причина збою connect для логу: `Display` reqwest пише лише вид помилки і URL.
+/// `timeout` — вузол мовчить (зник з мережі); інакше найглибша причина з ланцюга
+/// (`Connection refused`, `No route to host`, `Host is down`).
+fn connect_cause(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return "timeout".into();
+    }
+    let mut last: &dyn std::error::Error = e;
+    while let Some(s) = last.source() {
+        last = s;
+    }
+    last.to_string()
 }
 
 pub fn no_pick_status(n: NoPick) -> (u16, &'static str) {
@@ -584,7 +611,11 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
                 }
                 Err(e) => {
                     if classify(upstream_err(&e)) == Retry::MarkDeadAndRetry {
-                        Discovery::mark_dead(&gw.disc.cluster, &pick.pair.node_id);
+                        Discovery::mark_dead(
+                            &gw.disc.cluster,
+                            &pick.pair.node_id,
+                            &connect_cause(&e),
+                        );
                     }
                     exclude.insert(pick.pair.clone());
                     continue;
@@ -636,7 +667,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
             }
             Err(e) => {
                 if classify(upstream_err(&e)) == Retry::MarkDeadAndRetry {
-                    Discovery::mark_dead(&gw.disc.cluster, &pick.pair.node_id);
+                    Discovery::mark_dead(&gw.disc.cluster, &pick.pair.node_id, &connect_cause(&e));
                 }
                 exclude.insert(pick.pair.clone());
                 continue;
@@ -756,15 +787,78 @@ mod tests {
 
     #[test]
     fn upstream_failure_classification() {
-        assert_eq!(
-            classify(UpstreamErr::ConnectRefused),
-            Retry::MarkDeadAndRetry
-        );
+        assert_eq!(classify(UpstreamErr::Connect), Retry::MarkDeadAndRetry);
         assert_eq!(classify(UpstreamErr::Timeout), Retry::RetryOnly);
         assert_eq!(classify(UpstreamErr::Status(404)), Retry::RetryOnly);
         assert_eq!(classify(UpstreamErr::Status(409)), Retry::RetryOnly);
         assert_eq!(classify(UpstreamErr::Status(503)), Retry::RetryOnly);
         assert_eq!(classify(UpstreamErr::Status(500)), Retry::GiveUp);
+    }
+
+    #[test]
+    fn connect_failure_wins_over_timeout() {
+        assert_eq!(
+            upstream_kind(true, true),
+            UpstreamErr::Connect,
+            "connect timeout"
+        );
+        assert_eq!(
+            upstream_kind(true, false),
+            UpstreamErr::Connect,
+            "refused, unreachable"
+        );
+        assert_eq!(
+            upstream_kind(false, true),
+            UpstreamErr::Timeout,
+            "read timeout"
+        );
+        assert_eq!(upstream_kind(false, false), UpstreamErr::Status(502));
+    }
+
+    /// Резолвер, що ніколи не відповідає: DNS іде під connect-таймаутом reqwest, тож помилка —
+    /// саме connect-timeout, без мережі і без залежності від раннера CI.
+    struct NeverResolves;
+    impl reqwest::dns::Resolve for NeverResolves {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_is_a_connect_failure() {
+        let c = crate::net::peer_client_builder()
+            .connect_timeout(Duration::from_millis(100))
+            .dns_resolver(NeverResolves)
+            .build()
+            .unwrap();
+        // Ім'я хоста, не IP: для IP-адреси резолвер не викликається.
+        let send = c.get("http://peer.invalid:7411/exec").send();
+        let e = tokio::time::timeout(Duration::from_secs(5), send)
+            .await
+            .expect("connect timeout must fire")
+            .unwrap_err();
+        assert!(e.is_connect() && e.is_timeout(), "{e:?}");
+        assert_eq!(upstream_err(&e), UpstreamErr::Connect);
+        assert_eq!(classify(upstream_err(&e)), Retry::MarkDeadAndRetry);
+        assert_eq!(connect_cause(&e), "timeout");
+    }
+
+    #[tokio::test]
+    async fn refused_connect_names_its_cause() {
+        // Порт 1 поза ефемерним діапазоном: ядро не видає його ні на `bind(0)` паралельного
+        // тесту, ні клієнту як вихідний порт (self-connect на loopback). Звільнений ефемерний
+        // порт (bind → drop) інколи встигали зайняти — і приходив reset, а не refused.
+        // Прив'язаний сокет без listen не годиться: macOS на нього не шле RST, connect чекає таймауту.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let c = crate::net::peer_client_builder().build().unwrap();
+        let e = c
+            .get(format!("http://{addr}/exec"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(upstream_err(&e), UpstreamErr::Connect);
+        let why = connect_cause(&e);
+        assert!(why.to_lowercase().contains("refused"), "{why}");
     }
 
     #[test]

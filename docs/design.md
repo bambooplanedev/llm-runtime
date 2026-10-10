@@ -78,12 +78,12 @@ One JSON document per node at `GET /state`:
 
 ```json
 {
-  "proto": 1,
+  "proto": 2,
   "node_id": "b3f1…",
   "name": "macbook-m4",
   "addr": "192.168.1.10:7411",
   "version": "0.1.0",
-  "hw": { "cpu": "Apple M4", "device": "MTL0", "mem_limit_mb": 12124 },
+  "hw": { "device": "MTL0", "device_name": "Apple M4", "mem_limit_mb": 12124 },
   "models": [
     { "id": "qwen3-8b-q4_k_m", "file": "Qwen3-8B-Q4_K_M.gguf", "params_b": 8.2,
       "need_mb": 6800, "state": "loaded", "slots": 1, "inflight": 1 }
@@ -98,7 +98,11 @@ One JSON document per node at `GET /state`:
   the entry instead of duplicating it.
 - **`addr`** is the first mDNS-advertised address whose `/state` answers with the same `node_id`.
   IPv6 link-local is ignored in step 1.
-- **`proto`** is an integer compared for equality. Semver `version` is for humans only.
+- **`proto`** is an integer compared for equality. Semver `version` is for humans only. The
+  current protocol is 2: it renamed `hw.cpu` to `hw.device_name`, which always held the device
+  name (a GPU name on CUDA). A node on protocol 2 still reads a protocol-1 node's `/state`, shows
+  it, warns once a minute and sends it nothing; a protocol-1 node cannot read protocol 2 and does
+  not see the newer node at all. Upgrade all nodes together.
 - **`need_mb`** = `size_mb + kv_mb + 512`. `kv_mb` is derived from GGUF metadata and `llama_args`:
   `2 × kv_layers × kv_heads × head_dim × ctx × bytes_per_elem`, bytes from `-ctk`/`-ctv`. `-c` is the
   total context across all slots, so there is no `np` multiplier. `kv_layers` is `block_count`,
@@ -156,8 +160,9 @@ revision was removed as a weight without data.
 - `/exec` returns `409` if the model is no longer `loaded`, and `503` with the state as body if
   the child died before the first byte.
 - On `409` or `503` the pair goes into `exclude`, the snapshot updates from the body, and `pick`
-  runs again. Connect refused or unreachable marks the node dead immediately. A read timeout does
-  not. At most two retries, then `503`.
+  runs again. A failed connect (refused, unreachable, DNS failure or connect timeout) marks the
+  node dead immediately, and the log names the cause. A read timeout does not. At most two
+  retries, then `503`.
 - The gateway's HTTP client sets TCP keepalive explicitly (10 s idle, 5 s interval, 3 probes;
   `TCP_USER_TIMEOUT` 25 s on Linux). A peer that vanishes without a reset, for example with Wi-Fi
   off, is dropped in about 25 s on both OSes. Before the first byte the pair is excluded and
@@ -169,6 +174,11 @@ revision was removed as a weight without data.
   connection, which closes the child's connection and frees its slot; the node logs `stream
   dropped by peer`. The same line appears when a local client simply goes away mid-answer,
   since local requests also reach `/exec` over loopback.
+- The peer client never goes through a system proxy (`HTTP_PROXY`, macOS proxy settings): peers
+  are on the LAN. One gap remains on macOS: a new request written onto an idle pooled connection
+  to a peer that has since vanished is not covered by keepalive (the data is unacknowledged) and
+  waits for the system retransmission limit, then counts as a read timeout. Client sockets have
+  no `TCP_RXT_CONNDROPTIME` yet. Linux clients are covered by `TCP_USER_TIMEOUT`.
 - A non-2xx answer from the child itself comes back from `/exec` as is, marked with
   `x-llmrt-origin: child`. Gateway passes a 4xx to the client verbatim, retries a 503 on another
   pair, and turns any other 5xx into `502 "upstream failed"` with the child's message in the log.
@@ -182,14 +192,14 @@ A node or model failure never becomes a network failure.
 
 | Situation | Behavior |
 |---|---|
-| Connect refused on `/load` or `/exec` before any token | Node dead now, pair excluded, retry `pick` |
+| Connect refused, unreachable, DNS failure or connect timeout on `/load` or `/exec` | Node dead now, pair excluded, retry `pick` |
 | Read timeout on `/load` or `/exec` | Pair excluded, retry `pick`, node stays alive |
 | Model loads longer than `load_wait_secs` | `503 "model loading, retry"`, loading continues |
 | Child died before the first byte | `/exec` → `503` with state, pair excluded, retry |
 | Node vanished mid-stream | Stream ends with an `upstream_lost` SSE event, log `upstream_lost`; the executing node frees the slot within ~25 s |
 | `/state` silent for 2 s | Miss. Third miss in a row marks dead, then poll every 10 s |
 | `predicted_per_second` fell more than 5× against the first run of this model on this node | Warning in the log, routing unchanged. Metal exceeds its limit by thrashing, not by OOM, and nothing before start can catch it |
-| Different `proto` on one LAN | Nodes see each other, do not talk, warn once a minute |
+| Different `proto` on one LAN | A newer node sees the older one, warns once a minute and sends it nothing; an older node does not see the newer one. Upgrade all nodes together |
 | Empty directory or corrupt GGUF | Node announces without the file, logs it |
 | `llama-server` not found | The only fatal error: exit 1 with the paths searched |
 | llama.cpp returns 4xx (for example `exceed_context_size_error`) | Passed to the client verbatim: status, body, content type |
@@ -212,10 +222,16 @@ material for the automatic-tier spec. Without it step 1 is not done.
 
 Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
 
-- **Start.** `<llama_server> -m <file> --port <free port from child_ports> --host 127.0.0.1
-  --alias llmrt/<node_id>/<model_id> -np <slots>` plus `llama_args`. `-ngl` is not passed:
-  `--fit` is on by default. The alias is what the client sees in the `model` field and what orphan
-  cleanup greps for in `ps` output. Children listen on localhost only.
+- **Start.** `<llama_server> <llama_args> -m <file> --port <free port from child_ports> --host
+  127.0.0.1 --alias <model_id> --tags llmrt/<node_id>`, plus `-np <slots>` unless `llama_args`
+  sets it. `llama_args` come first so the fixed flags win. `-ngl` is not passed: `--fit` is on by
+  default. The alias is what the client sees in the `model` field of every response, the same id
+  as in `/v1/models`; the executing node is in `requests.jsonl`. The tag is the orphan marker.
+  `--alias` and `--tags` in `llama_args` get a startup warning. llama.cpp splits `--alias` on
+  commas, so a model file name with a comma shows only part of its id in `model`; routing is
+  unaffected. At startup the daemon also runs `<llama_server> --help` and refuses to start if
+  `--tags` is missing (older builds would fail every child start). Children listen on localhost
+  only.
 - **Memory.** `need_mb ≤ free_mb` before start, otherwise refuse immediately. Layer placement
   between VRAM and RAM within the limit is llama.cpp's job.
 - **Readiness.** `loading` while `GET /health` returns `503 "Loading model"` and the process is
@@ -249,7 +265,8 @@ Runner keeps `model_id → Child { pid, port, state, last_used, inflight }`.
 - **Client disconnect.** The guard closes the upstream connection and `llama serve` cancels the
   task itself, also for non-stream requests.
 - **Orphans.** Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` in `pre_exec`. macOS has no equivalent,
-  so at startup the daemon kills processes whose argv contains `--alias llmrt/<own node_id>/`.
+  so at startup the daemon kills processes whose argv has `--tags llmrt/<own node_id>`, or the
+  older marker `--alias llmrt/<own node_id>/` left by protocol-1 daemons.
   Other people's `llama-server` processes, Ollama, a second daemon in CI are untouched because the
   marker contains `node_id`.
 - **Shutdown.** `SIGTERM` or `SIGINT` starts axum's graceful shutdown; in-flight requests get up
@@ -274,13 +291,15 @@ that are not obvious from the table:
 ## 8. Verified against llama.cpp
 
 All facts below were checked on llama.cpp build 10826 (`llama` launcher, `llama serve`), macOS,
-Apple M4 16 GB, before the first line of code.
+Apple M4 16 GB, before the first line of code; rows marked b11046 were checked later on that
+build.
 
 | Question | Fact | Consequence |
 |---|---|---|
 | `--list-devices` format | `MTL0: Apple M4 (12124 MiB, 12123 MiB free)`, then `BLAS: Accelerate (0 MiB, 0 MiB free)` | Device is `MTL0`, not `Metal`. Limit is ~74 % of RAM. Parser takes the first GPU-prefixed line, first number is total |
 | `--fit` | `on` by default, `-ngl auto`, `--fit-target 1024` MiB | `-ngl` is never passed |
-| `--alias` | `-a, --alias STRING`, visible in `ps` argv | Orphan marker works |
+| `--alias`, `--tags` (b11046) | `-a, --alias STRING` and `--tags STRING`, both comma-separated and visible in `ps` argv; `/v1/models` lists them as `aliases` and `tags` | The alias is the model id, the tag is the orphan marker |
+| `model` in responses (b11046) | Always an alias, whatever `model` the request sent; with several aliases, `llmrt/…` wins over the plain id in either order | One alias only: the model id |
 | `/health` during load | `503 {"error":{"message":"Loading model",…}}`, then `200 {"status":"ok"}`, connection refused before bind | Fake server reproduces it verbatim |
 | Context per slot | `-c 4096 -np 2` gives `n_ctx_slot = 2048`, `total_slots = 2` | `-c` is total context, no `np` multiplier in `kv_mb`. `n_gpu_layers` is absent from `/props` |
 | `timings` in stream | Present in the final chunk with no extra flags | Enough for the log |

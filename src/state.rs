@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 
-pub const PROTO: u32 = 1;
+pub const PROTO: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,8 +16,12 @@ pub enum ModelState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hw {
-    pub cpu: String,
     pub device: String,
+    /// Назва пристрою з `--list-devices`: GPU на CUDA/ROCm/Vulkan, `Apple M4` на Metal.
+    /// `cpu` — ім'я цього поля в протоколі 1: стан такого вузла однаково розбирається,
+    /// і його відсіює planner за `proto`, а не мовчазна помилка розбору.
+    #[serde(alias = "cpu")]
+    pub device_name: String,
     pub mem_limit_mb: u64,
 }
 
@@ -69,9 +73,9 @@ pub fn now_secs() -> u64 {
 mod tests {
     use super::*;
     const EXAMPLE: &str = r#"{
-      "proto": 1, "node_id": "b3f1", "name": "macbook-m4", "addr": "192.168.1.10:7411",
+      "proto": 2, "node_id": "b3f1", "name": "macbook-m4", "addr": "192.168.1.10:7411",
       "version": "0.1.0",
-      "hw": { "cpu": "Apple M4", "device": "MTL0", "mem_limit_mb": 12124 },
+      "hw": { "device": "MTL0", "device_name": "Apple M4", "mem_limit_mb": 12124 },
       "models": [
         { "id": "qwen3-8b-q4_k_m", "file": "Qwen3-8B-Q4_K_M.gguf", "params_b": 8.2,
           "need_mb": 6800, "state": "loaded", "slots": 1, "inflight": 1 },
@@ -84,6 +88,7 @@ mod tests {
     fn round_trip_protocol_example() {
         let s: NodeState = serde_json::from_str(EXAMPLE).unwrap();
         assert_eq!(s.proto, PROTO);
+        assert_eq!(s.hw.device_name, "Apple M4");
         assert_eq!(s.models[0].state, ModelState::Loaded);
         assert_eq!(s.models[1].active_params_b, None);
         let back = serde_json::to_string(&s).unwrap();
@@ -93,5 +98,22 @@ mod tests {
             back.contains("\"state\":\"loaded\""),
             "state must serialize lowercase"
         );
+        assert!(back.contains("\"device_name\":\"Apple M4\""), "{back}");
+        assert!(
+            !back.contains("\"cpu\""),
+            "old field name must not be sent: {back}"
+        );
+    }
+
+    /// Вузол зі старим протоколом шле `proto: 1` і поле `cpu`: його стан однаково
+    /// розбирається — вузол видно, а відсіює його planner за `proto`, з warning у discovery.
+    #[test]
+    fn old_protocol_state_still_parses() {
+        let v1 = EXAMPLE
+            .replace("\"proto\": 2", "\"proto\": 1")
+            .replace("\"device_name\"", "\"cpu\"");
+        let s: NodeState = serde_json::from_str(&v1).unwrap();
+        assert_eq!(s.proto, 1);
+        assert_eq!(s.hw.device_name, "Apple M4");
     }
 }
