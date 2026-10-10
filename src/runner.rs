@@ -677,13 +677,10 @@ impl Runner {
         self,
         target: String,
         mut waiters: Vec<(String, tokio::task::JoinHandle<()>)>,
+        // Параметри звільняються після локальних змінних тіла: guard бере lock, коли всі
+        // MutexGuard уже скинуті, і існує навіть якщо задачу ні разу не опитали.
+        _guard: EvictGuard,
     ) -> LoadOutcome {
-        // ПЕРШИМ: guard бере mutex у Drop, а локальні змінні звільняються у зворотному порядку.
-        // Оголошений після MutexGuard — він би заблокувався на власному lock-у.
-        let _guard = EvictGuard {
-            runner: self.clone(),
-            target: target.clone(),
-        };
         let all_exited = async {
             for (_, h) in waiters.iter_mut() {
                 let _ = h.await;
@@ -753,7 +750,11 @@ impl Runner {
             }
         };
         if let Some(waiters) = evict {
-            let task = tokio::spawn(self.clone().eviction_task(id.to_string(), waiters));
+            let guard = EvictGuard {
+                runner: self.clone(),
+                target: id.to_string(),
+            };
+            let task = tokio::spawn(self.clone().eviction_task(id.to_string(), waiters, guard));
             return task.await.unwrap_or(LoadOutcome::SpawnFailed);
         }
         let reported = match probe_reported(probe).await {
@@ -995,7 +996,7 @@ impl Runner {
                                     let _ = p.child.wait();
                                 })
                                 .await;
-                                // Зі стану Draining слот виводить лише ця задача або shutdown().
+                                // Зі стану Draining слот виводять лише ця задача, очікувачі витіснення або shutdown() (через `finish_drain`).
                                 runner.finish_drain(&id);
                             });
                         }

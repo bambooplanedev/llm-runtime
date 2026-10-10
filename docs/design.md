@@ -113,7 +113,8 @@ One JSON document per node at `GET /state`:
   the only named constant. After a child starts, runner reads `/props` and logs any mismatch
   between `n_ctx × total_slots` and `-c`. That is the formula's test on real models.
 - **`free_mb`** = `mem_limit_mb − os_reserve_mb − Σ need_mb` of loading, loaded and draining models.
-  On CUDA it is additionally capped by free memory from `--list-devices`, which is real
+  The advertised `free_mb` is this bookkeeping value. On CUDA, when a model is loaded, the
+  available memory is additionally capped by free memory from `--list-devices`, which is real
   `cudaMemGetInfo`. That value already excludes what the OS and other processes hold, so
   `os_reserve_mb` is not subtracted from it a second time. On Metal the reported free value is
   meaningless and unused.
@@ -204,7 +205,7 @@ A node or model failure never becomes a network failure.
 | Connect refused, unreachable, DNS failure or connect timeout on `/load` or `/exec` | Node dead now, pair excluded, retry `pick` |
 | Read timeout on `/load` or `/exec` | Pair excluded, retry `pick`, node stays alive |
 | Model loads longer than `load_wait_secs` | `503 "model loading, retry"`, loading continues |
-| Eviction victim does not exit within 10 s, or real free VRAM is still short after it | `409`, pair excluded, retry `pick`. The victims stay unloaded; a retry may evict on another node |
+| Eviction victim does not exit within 10 s, or real free VRAM is still short after it | `409`, pair excluded, retry `pick`. Victims that exited stay unloaded; a stuck one stays `draining`, holding its memory, until it exits. A retry may evict on another node |
 | Child died before the first byte | `/exec` → `503` with state, pair excluded, retry |
 | Node vanished mid-stream | Stream ends with an `upstream_lost` SSE event, log `upstream_lost`; the executing node frees the slot within ~25 s |
 | `/state` silent for 2 s | Miss. Third miss in a row marks dead, then poll every 10 s |

@@ -997,3 +997,55 @@ async fn probe_timeout_after_eviction_leaves_target_loadable() {
     bg.abort();
     r.shutdown().await;
 }
+
+/// shutdown() посеред витіснення: ціль нічого не стартує і лишається `Available`.
+#[tokio::test]
+async fn shutdown_during_eviction_starts_nothing() {
+    let mut c = evict_cfg((7643, 7644));
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=300 {}", fake());
+    let r = Runner::new(
+        &c,
+        cuda(1500),
+        vec![lm("a", 1000), lm("b", 1000)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let rb = r.clone();
+    let task = tokio::spawn(async move { rb.load("b").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    r.shutdown().await;
+    let out = task.await.unwrap();
+    assert!(matches!(out, LoadOutcome::ShuttingDown), "{out:?}");
+    assert_eq!(state_of(&r, "b"), ModelState::Available);
+    assert_eq!(r.snapshot().1, 1500);
+    bg.abort();
+}
+
+/// Резерв цілі витіснення не віддається третій моделі.
+#[tokio::test]
+async fn reserved_memory_is_not_given_to_a_third_model() {
+    let mut c = evict_cfg((7645, 7646));
+    c.llama_server = format!("env FAKE_LIST_DEVICES_SLEEP_MS=300 {}", fake());
+    let r = Runner::new(
+        &c,
+        cuda(1500),
+        vec![lm("a", 1000), lm("b", 1000), lm("c", 600)],
+        "n1".into(),
+    );
+    let bg = tokio::spawn(r.clone().run_background());
+    assert!(matches!(r.load("a").await, LoadOutcome::Accepted));
+    wait_loaded(&r, "a").await;
+    let rb = r.clone();
+    let task = tokio::spawn(async move { rb.load("b").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Без резерву цілі після виходу a було б вільно 1500 — c (600) забрала б пам'ять b.
+    let out = r.load("c").await;
+    assert!(matches!(out, LoadOutcome::NoMemory), "{out:?}");
+    let out = task.await.unwrap();
+    assert!(matches!(out, LoadOutcome::Accepted), "{out:?}");
+    wait_loaded(&r, "b").await;
+    bg.abort();
+    r.shutdown().await;
+}
