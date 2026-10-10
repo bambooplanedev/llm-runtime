@@ -845,9 +845,11 @@ mod tests {
 
     #[tokio::test]
     async fn refused_connect_names_its_cause() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        drop(l); // порт вільний — connect отримає RST
+        // Порт 1 поза ефемерним діапазоном: ядро не видає його ні на `bind(0)` паралельного
+        // тесту, ні клієнту як вихідний порт (self-connect на loopback). Звільнений ефемерний
+        // порт (bind → drop) інколи встигали зайняти — і приходив reset, а не refused.
+        // Прив'язаний сокет без listen не годиться: macOS на нього не шле RST, connect чекає таймауту.
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
         let c = crate::net::peer_client_builder().build().unwrap();
         let e = c
             .get(format!("http://{addr}/exec"))
