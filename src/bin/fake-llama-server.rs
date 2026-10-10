@@ -18,11 +18,13 @@
 //!   (after the log line above), to simulate a wedged driver.
 //! - `FAKE_LIST_DEVICES_SLEEP_IF` — path; while that file exists, `--list-devices` sleeps 20 s, so a
 //!   test can wedge the driver only after the first load.
-//! - `FAKE_CHAT_STATUS` — answer every chat request with this status and an `exceed_context_size_error` body.
+//! - `FAKE_CHAT_STATUS` — answer every chat, completions and infill request with this status and an
+//!   `exceed_context_size_error` body. `FAKE_TOKENS`, `FAKE_PREFILL_MS`, `FAKE_DIE_MID_STREAM` apply to
+//!   all three routes too; `FAKE_DIE_MID_LINE` to chat only.
 //! - `FAKE_NO_TAGS=1`       — `--help` omits `--tags`, as an llama.cpp build too old for llmrt.
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -146,7 +148,11 @@ async fn main() {
         .route("/health", get(health))
         .route("/props", get(props))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/completions", post(completions))
+        .route("/infill", post(infill))
         .route("/v1/models", get(models))
+        // Як справжній llama-server: великий `input_extra` не має впиратися в 2 МБ axum.
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(Arc::new(app));
     let l = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -289,4 +295,123 @@ async fn chat(
         }
     });
     Sse::new(s).into_response()
+}
+
+/// Спільний початок трьох генеруючих маршрутів: «вантажиться», `FAKE_CHAT_STATUS`, prefill.
+async fn gen_prelude(a: &App) -> Option<axum::response::Response> {
+    if loading(a) {
+        return Some(loading_err().into_response());
+    }
+    if let Some(code) = a.chat_status {
+        return Some(
+            (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                Json(serde_json::json!({"error":{"code":code,
+                    "message":"fake context exceeded","type":"exceed_context_size_error"}})),
+            )
+                .into_response(),
+        );
+    }
+    if a.prefill_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(a.prefill_ms)).await;
+    }
+    None
+}
+
+fn fake_timings(a: &App) -> serde_json::Value {
+    serde_json::json!({"prompt_n": 7, "prompt_ms": 12.0, "predicted_n": a.tokens,
+        "predicted_ms": 50.0 * a.tokens as f64, "predicted_per_second": 20.0})
+}
+
+/// SSE `data:` по одній події раз на 50 ms; з `die` — exit(4) на третій (дві вже пішли клієнту).
+fn sse_events(events: Vec<String>, die: bool) -> axum::response::Response {
+    let s = stream::unfold(0usize, move |i| {
+        let ev = events.get(i).cloned();
+        async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if die && i == 2 {
+                std::process::exit(4);
+            }
+            ev.map(|e| {
+                (
+                    Ok::<_, std::convert::Infallible>(Event::default().data(e)),
+                    i + 1,
+                )
+            })
+        }
+    });
+    Sse::new(s).into_response()
+}
+
+fn streaming(body: &serde_json::Value) -> bool {
+    body.get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Як b11429: `text_completion`; у стрімі `usage` і `timings` в останньому чанку завжди, потім `[DONE]`.
+async fn completions(
+    State(a): State<Arc<App>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    if let Some(r) = gen_prelude(&a).await {
+        return r;
+    }
+    let usage = serde_json::json!({"prompt_tokens": 7, "completion_tokens": a.tokens, "total_tokens": 7 + a.tokens});
+    let timings = fake_timings(&a);
+    if !streaming(&body) {
+        return Json(
+            serde_json::json!({"id":"cmpl-fake","object":"text_completion","model":a.alias,
+            "choices":[{"index":0,"text":"hello from fake","logprobs":null,"finish_reason":"stop"}],
+            "usage":usage,"timings":timings}),
+        )
+        .into_response();
+    }
+    let mut ev: Vec<String> = (0..a.tokens)
+        .map(|i| {
+            serde_json::json!({"id":"cmpl-fake","object":"text_completion","model":a.alias,
+                "choices":[{"index":0,"text":format!("tok{i} "),"logprobs":null,"finish_reason":null}]})
+            .to_string()
+        })
+        .collect();
+    ev.push(
+        serde_json::json!({"id":"cmpl-fake","object":"text_completion","model":a.alias,
+            "choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"stop"}],
+            "usage":usage,"timings":timings})
+        .to_string(),
+    );
+    ev.push("[DONE]".into());
+    sse_events(ev, a.die_mid)
+}
+
+/// Як b11429: нативний формат; `tokens_*` у кожному чанку, `timings` в останньому, без `[DONE]`.
+async fn infill(
+    State(a): State<Arc<App>>,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    if let Some(r) = gen_prelude(&a).await {
+        return r;
+    }
+    let timings = fake_timings(&a);
+    if !streaming(&body) {
+        return Json(
+            serde_json::json!({"index":0,"content":"hello from fake","tokens":[],"id_slot":0,
+            "stop":true,"model":a.alias,"tokens_predicted":a.tokens,"tokens_evaluated":7,
+            "timings":timings}),
+        )
+        .into_response();
+    }
+    let mut ev: Vec<String> = (0..a.tokens)
+        .map(|i| {
+            serde_json::json!({"index":0,"content":format!("tok{i} "),"tokens":[i],"stop":false,
+                "id_slot":-1,"tokens_predicted":i + 1,"tokens_evaluated":7})
+            .to_string()
+        })
+        .collect();
+    ev.push(
+        serde_json::json!({"index":0,"content":"","tokens":[],"id_slot":0,"stop":true,
+            "model":a.alias,"tokens_predicted":a.tokens,"tokens_evaluated":7,"timings":timings})
+        .to_string(),
+    );
+    sse_events(ev, a.die_mid)
 }

@@ -254,6 +254,80 @@ fn chat_raw(port: u16, model: &str) -> (u16, Result<String, String>) {
     (r.status().as_u16(), r.text().map_err(|e| e.to_string()))
 }
 
+/// POST довільного JSON; тіло — текстом, або помилка транспорту (обрив chunked) — рядком.
+fn post_raw(port: u16, path: &str, body: serde_json::Value) -> (u16, Result<String, String>) {
+    let c = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let r = c
+        .post(format!("http://127.0.0.1:{port}{path}"))
+        .json(&body)
+        .send()
+        .unwrap();
+    (r.status().as_u16(), r.text().map_err(|e| e.to_string()))
+}
+
+fn post_json(port: u16, path: &str, body: serde_json::Value) -> (u16, String) {
+    let (code, text) = post_raw(port, path, body);
+    (code, text.unwrap())
+}
+
+/// Сусід старої версії: `/state` без `apis`, модель `stub-model` у `loaded`; `/exec` рахує
+/// виклики й віддає готову chat-відповідь. Живе у власному потоці до кінця процесу.
+fn old_peer(port: u16) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use axum::routing::{get, post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let state = serde_json::json!({
+                "proto": 2, "node_id": "old-peer", "name": "old-peer",
+                "addr": format!("127.0.0.1:{port}"), "version": "0.0.9",
+                "hw": {"device": "CPU", "device_name": "", "mem_limit_mb": 8192},
+                "models": [{"id": "stub-model", "file": "stub-model.gguf", "params_b": 1.0,
+                    "need_mb": 1000, "state": "loaded", "slots": 1, "inflight": 0}],
+                "free_mb": 4000, "seen": 0
+            });
+            let app = axum::Router::new()
+                .route(
+                    "/state",
+                    get(move || {
+                        let s = state.clone();
+                        async move { axum::Json(s) }
+                    }),
+                )
+                .route(
+                    "/exec",
+                    post(move || {
+                        let h = h.clone();
+                        async move {
+                            h.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({"id": "chatcmpl-old",
+                                "object": "chat.completion", "model": "stub-model",
+                                "choices": [{"index": 0, "message": {"role": "assistant",
+                                    "content": "hello from old peer"}, "finish_reason": "stop"}]}))
+                        }
+                    }),
+                );
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            tx.send(()).unwrap();
+            axum::serve(l, app).await.unwrap();
+        });
+    });
+    rx.recv().unwrap();
+    hits
+}
+
 /// Непорожні SSE-події тіла (без роздільника `\n\n`).
 fn sse_events(body: &str) -> Vec<&str> {
     body.split("\n\n")
@@ -1140,4 +1214,156 @@ llama_args = ["-c", "512"]
     };
     assert_eq!(state("p-1b"), "available", "{s}");
     assert_eq!(state("q-1b"), "loaded", "{s}");
+}
+
+/// `/v1/completions` і `/infill` доходять до своїх маршрутів дитини, stream і без; `/infill` без
+/// `model` бере `infill_model`; у лозі `api` і токени (для infill — з `tokens_*`).
+#[test]
+fn completions_and_infill_reach_their_child_routes_and_are_logged() {
+    let _s = serial();
+    let a = spawn_with(
+        7820,
+        "7830-7833",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"tiny-0.2b\"",
+            ..Default::default()
+        },
+    );
+    node_up(a.port, 1);
+    for stream in [false, true] {
+        let (code, body) = post_json(
+            a.port,
+            "/v1/completions",
+            serde_json::json!({"model": "small", "prompt": "def f():", "stream": stream}),
+        );
+        assert_eq!(code, 200, "stream={stream}: {body}");
+        assert!(body.contains("text_completion"), "stream={stream}: {body}");
+        assert_eq!(body.contains("[DONE]"), stream, "{body}");
+
+        let (code, body) = post_json(
+            a.port,
+            "/infill",
+            serde_json::json!({"input_prefix": "x = ", "input_suffix": "", "stream": stream}),
+        );
+        assert_eq!(code, 200, "stream={stream}: {body}");
+        assert!(body.contains("tokens_predicted"), "stream={stream}: {body}");
+        assert!(
+            !body.contains("text_completion") && !body.contains("[DONE]"),
+            "{body}"
+        );
+    }
+    // Не рядок або самі пробіли — як відсутній `model`.
+    for m in [
+        serde_json::Value::Null,
+        serde_json::json!(5),
+        serde_json::json!("  "),
+    ] {
+        let (code, body) = post_json(
+            a.port,
+            "/infill",
+            serde_json::json!({"model": m, "input_prefix": "x", "input_suffix": ""}),
+        );
+        assert_eq!(code, 200, "model={m}: {body}");
+    }
+    wait_log(
+        a.dir.path(),
+        |r| {
+            let ok = |x: &&serde_json::Value| {
+                x["status"] == 200
+                    && x["prompt_tokens"] == 7
+                    && x["completion_tokens"] == 5
+                    && !x["ttft_ms"].is_null()
+            };
+            let cmpl = r
+                .iter()
+                .filter(|x| x["api"] == "completions")
+                .filter(ok)
+                .count();
+            let fim = r
+                .iter()
+                .filter(|x| x["api"] == "infill" && x["requested"] == "tiny-0.2b")
+                .filter(ok)
+                .count();
+            cmpl == 2 && fim == 5
+        },
+        "2 completions and 5 infill records with tokens",
+    );
+}
+
+/// Без `model` і без `infill_model` — 400 з підказкою; `infill_model` з невідомим id —
+/// зрозуміле `400 unknown model`.
+#[test]
+fn infill_without_a_model_is_a_clear_400() {
+    let _s = serial();
+    let a = spawn(7821, "7834-7837", &[], &[("tiny-0.2b.gguf", 2)]);
+    node_up(a.port, 1);
+    let (code, body) = post_json(
+        a.port,
+        "/infill",
+        serde_json::json!({"input_prefix": "x", "input_suffix": ""}),
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("infill_model"), "{body}");
+    let (code, body) = post_json(
+        a.port,
+        "/v1/completions",
+        serde_json::json!({"prompt": "x"}),
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("model is required"), "{body}");
+    drop(a);
+
+    let b = spawn_with(
+        7827,
+        "7854-7857",
+        &[],
+        &[("tiny-0.2b.gguf", 2)],
+        Opts {
+            extra_toml: "infill_model = \"no-such-coder\"",
+            ..Default::default()
+        },
+    );
+    node_up(b.port, 1);
+    let (code, body) = post_json(
+        b.port,
+        "/infill",
+        serde_json::json!({"input_prefix": "x", "input_suffix": ""}),
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("unknown model"), "{body}");
+}
+
+/// Сусід старої версії (без `apis` у `/state`) не отримує infill через `/exec` — інакше його
+/// chat-дитина отримала б тіло `/infill`; chat до нього доходить як раніше.
+#[test]
+fn old_peer_gets_chat_but_never_infill() {
+    let _s = serial();
+    let hits = old_peer(7823);
+    let a = spawn(7822, "7838-7841", &[7823], &[("tiny-0.2b.gguf", 2)]);
+    wait_for(
+        a.port,
+        |v| {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == "stub-model")
+        },
+        "/v1/models",
+        "old peer visible",
+    );
+    let (code, body) = post_json(
+        a.port,
+        "/infill",
+        serde_json::json!({"model": "stub-model", "input_prefix": "x", "input_suffix": ""}),
+    );
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("supports this endpoint"), "{body}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let (code, body) = chat(a.port, "stub-model", false);
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("hello from old peer"), "{body}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
