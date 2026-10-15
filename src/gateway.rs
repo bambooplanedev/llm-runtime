@@ -1,5 +1,5 @@
 //! HTTP-шар `llmrt`: peer-роути `/state`, `/load`, `/exec` і клієнтські
-//! `/v1/models`, `/v1/chat/completions`.
+//! `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/infill`.
 //!
 //! Два прийоми тримають облік чесним на всіх шляхах виходу:
 //! `InflightGuard` живе всередині тіла відповіді `/exec`, а `Finish` пише
@@ -11,7 +11,7 @@ use crate::planner::{self, NoPick, Pair, Pick, TIER_NAMES};
 use crate::reqlog::{Record, ReqLog};
 use crate::runner::{ExecTarget, LoadOutcome, Runner};
 use crate::sse::{self, EventGate};
-use crate::state::{now_secs, Cluster, Hw, ModelState, NodeState, NodeView, PROTO};
+use crate::state::{now_secs, Api, Cluster, Hw, ModelState, NodeState, NodeView, PROTO};
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
@@ -71,6 +71,9 @@ pub fn router(gw: Gateway) -> Router {
         .route("/exec", post(exec))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/completions", post(completions))
+        .route("/infill", post(infill))
+        // Шар обгортає лише маршрути, додані до нього: нові маршрути — тільки вище.
         // Дефолтні 2 МБ вистачає не всякому промпту, а 413 — не той код, що бачить клієнт.
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .fallback(|| async { err(400, "unknown route") })
@@ -91,6 +94,7 @@ pub fn local_state(gw: &Gateway) -> NodeState {
         models,
         free_mb,
         reclaimable_mb,
+        apis: crate::state::supported_apis(),
         seen: now_secs(),
     }
 }
@@ -123,7 +127,15 @@ async fn load(State(gw): State<Gateway>, Json(r): Json<LoadReq>) -> Response {
 #[derive(serde::Deserialize)]
 struct ExecReq {
     model: String,
+    /// Рядок, а не `Api`: невідоме значення (застарілий знімок) — це `404` «шукай інший вузол»,
+    /// а не `422` екстрактора, з якого gateway зробив би `502`.
+    #[serde(default = "chat_api")]
+    api: String,
     body: serde_json::Value,
+}
+
+fn chat_api() -> String {
+    Api::Chat.as_str().into()
 }
 
 /// Лог, коли тіло `/exec` дропнуто до кінця upstream: peer зник або відпав клієнт.
@@ -149,6 +161,9 @@ impl Drop for ExecEnd {
 /// Без `pick` — прямо на локальний дочірній процес; inflight тримає guard у тілі відповіді.
 async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
     let started = Instant::now();
+    let Some(api) = Api::parse(&r.api) else {
+        return (StatusCode::NOT_FOUND, Json(local_state(&gw))).into_response();
+    };
     let (port, guard) = match gw.runner.exec_target(&r.model) {
         ExecTarget::Ready { port, guard } => (port, guard),
         ExecTarget::NotLoaded => {
@@ -160,7 +175,7 @@ async fn exec(State(gw): State<Gateway>, Json(r): Json<ExecReq>) -> Response {
     // streams llama.cpp) вимкнув би скасування генерації при розриві з'єднання.
     let up = gw
         .http
-        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .post(format!("http://127.0.0.1:{port}{}", api.child_path()))
         .timeout(EXEC_TIMEOUT)
         .json(&r.body)
         .send()
@@ -249,17 +264,19 @@ async fn models(State(gw): State<Gateway>) -> Json<serde_json::Value> {
     }))
 }
 
-/// Модель підміняємо на конкретний id вузла; `usage` у стрімі llama.cpp дає
-/// лише `stream_options.include_usage`.
+/// Модель підміняємо на конкретний id вузла (нативний `/infill` поле ігнорує — нешкідливо);
+/// `usage` у стрімі chat дає лише `stream_options.include_usage`, completions — теж, щоб не
+/// залежати від збірки llama.cpp. У `/infill` такого поля немає.
 ///
 /// Тіло — довільний JSON від клієнта, тож жодного `Value` не індексуємо наосліп:
 /// `IndexMut` для `Value` панікує на всьому, що не об'єкт і не `null`.
-pub fn prepare_upstream_body(body: &mut serde_json::Value, model_id: &str) {
+pub fn prepare_upstream_body(body: &mut serde_json::Value, model_id: &str, api: Api) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };
     obj.insert("model".into(), model_id.into());
-    if obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false) {
+    let streaming = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    if streaming && api != Api::Infill {
         let so = obj
             .entry("stream_options")
             .or_insert_with(|| serde_json::json!({}));
@@ -267,6 +284,20 @@ pub fn prepare_upstream_body(body: &mut serde_json::Value, model_id: &str) {
             *so = serde_json::json!({});
         }
         so["include_usage"] = true.into();
+    }
+}
+
+/// llama.cpp відхиляє `n_cmpl` більше за кількість слотів (`-np`) з 400, а llama.vscode за
+/// замовчуванням шле 3. Одна підказка краща за жодну: обрізаємо до слотів обраної моделі.
+pub fn clamp_n_cmpl(body: &mut serde_json::Value, slots: u32) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let max = u64::from(slots.max(1));
+    if let Some(n) = obj.get("n_cmpl").and_then(|v| v.as_u64()) {
+        if n > max {
+            obj.insert("n_cmpl".into(), max.into());
+        }
     }
 }
 
@@ -299,6 +330,12 @@ async fn read_capped(u: reqwest::Response, limit: usize) -> Bytes {
     Bytes::from(out)
 }
 
+/// Причина помилки дитини для логу. Символи, не байти: зріз по байтах панікує на UTF-8.
+fn child_error(code: u16, body: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(body).chars().take(200).collect();
+    format!("child {code}: {text}")
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChildErr {
     PassThrough,
@@ -310,12 +347,12 @@ pub enum ChildErr {
 pub fn classify_child(code: u16) -> ChildErr {
     match code {
         503 => ChildErr::Retry,
-        400..=499 => ChildErr::PassThrough,
+        400..=499 | 501 => ChildErr::PassThrough,
         _ => ChildErr::BadGateway,
     }
 }
 
-/// 4xx від llama.cpp — клієнту дослівно: `exceed_context_size_error` його SDK зрозуміє краще за 502.
+/// 4xx і 501 від llama.cpp — клієнту дослівно: `exceed_context_size_error` його SDK зрозуміє краще за 502.
 /// `give_up` не годиться: він завжди формує власне тіло.
 async fn pass_through(
     gw: &Gateway,
@@ -327,7 +364,7 @@ async fn pass_through(
     let ct = u.headers().get(header::CONTENT_TYPE).cloned();
     let body = read_capped(u, ERR_BODY_LIMIT).await;
     rec.status = code;
-    rec.error = Some(format!("child {code}"));
+    rec.error = Some(child_error(code, &body));
     rec.wall_ms = started.elapsed().as_millis() as u64;
     gw.log.write(&rec);
     let mut resp = (
@@ -388,10 +425,14 @@ pub fn no_pick_status(n: NoPick) -> (u16, &'static str) {
         NoPick::UnknownModel => (400, "unknown model"),
         NoPick::NoSuchTier => (503, "no model of this tier in the cluster"),
         NoPick::AllBusy => (503, "no node can take this model right now"),
+        NoPick::ApiUnsupported => (
+            503,
+            "no node with this model supports this endpoint; upgrade llmrt there",
+        ),
     }
 }
 
-/// Клієнт бачить лише 400/502/503 у форматі OpenAI.
+/// Клієнт бачить 400/502/503 у форматі OpenAI, а також 4xx і 501 самої дитини.
 fn err(code: u16, msg: &str) -> Response {
     (
         StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -499,7 +540,7 @@ impl Finish {
         }
     }
 
-    /// Бере кожну подію з `usage` або `timings`: `fill_from_final_chunk` не стирає
+    /// Бере кожну подію з `usage`, `timings` або `tokens_predicted`: `fill_from_final_chunk` не стирає
     /// вже заповнені поля, тож перемагає остання, де поле є.
     fn absorb(&mut self, line: &[u8]) {
         let text = String::from_utf8_lossy(line);
@@ -509,8 +550,20 @@ impl Finish {
             None => text.trim(),
         };
         if let Ok(j) = serde_json::from_str::<serde_json::Value>(payload) {
-            if j.get("usage").is_some() || j.get("timings").is_some() {
-                ReqLog::fill_from_final_chunk(&mut self.rec, &j);
+            if self.streaming {
+                // `tokens_predicted` — нативний `/infill`, у ньому немає `usage`.
+                if j.get("usage").is_some()
+                    || j.get("timings").is_some()
+                    || j.get("tokens_predicted").is_some()
+                {
+                    ReqLog::fill_from_final_chunk(&mut self.rec, &j);
+                }
+            } else if j.is_array()
+                || j.get("usage").is_some()
+                || j.get("timings").is_some()
+                || j.get("tokens_predicted").is_some()
+            {
+                ReqLog::fill_from_body(&mut self.rec, &j);
             }
         }
     }
@@ -531,27 +584,53 @@ impl Drop for Finish {
     }
 }
 
-/// Тіло беремо сирими байтами: `Json`-екстрактор відповів би 415/413/плейнтекст-400,
-/// а клієнт має бачити лише 400/502/503 у форматі OpenAI.
 async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
+    proxy(gw, raw, Api::Chat).await
+}
+
+async fn completions(State(gw): State<Gateway>, raw: Bytes) -> Response {
+    proxy(gw, raw, Api::Completions).await
+}
+
+/// llama.vscode не шле `model`: тоді береться `infill_model` з конфігу.
+async fn infill(State(gw): State<Gateway>, raw: Bytes) -> Response {
+    proxy(gw, raw, Api::Infill).await
+}
+
+/// Спільний шлях трьох клієнтських API. Тіло беремо сирими байтами: `Json`-екстрактор
+/// відповів би 415/413/плейнтекст-400, а клієнт має бачити лише 400/502/503 у форматі OpenAI.
+async fn proxy(gw: Gateway, raw: Bytes, api: Api) -> Response {
     let started = Instant::now();
     let body: serde_json::Value = serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
-    let requested = body
+    // Не рядок, порожній чи з пробілів — як відсутній.
+    let from_body = body
         .get("model")
         .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .to_string();
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let requested = match (from_body, api) {
+        (Some(m), _) => m.to_string(),
+        (None, Api::Infill) => gw.cfg.infill_model.clone().unwrap_or_default(),
+        (None, _) => String::new(),
+    };
     // Рядок логу має бути й на 400, тож `rec` існує до будь-якої перевірки.
     let mut rec = Record {
         ts: now_secs(),
         requested: requested.clone(),
+        api,
         ..Default::default()
     };
     if !body.is_object() {
         return give_up(&gw, rec, started, 400, "body must be a JSON object");
     }
     let Some(want) = planner::parse_want(&requested) else {
-        return give_up(&gw, rec, started, 400, "model is required");
+        let msg = match api {
+            Api::Infill => {
+                "model is required; set infill_model in the config for clients that do not send it"
+            }
+            _ => "model is required",
+        };
+        return give_up(&gw, rec, started, 400, msg);
     };
     let mut exclude: HashSet<Pair> = HashSet::new();
 
@@ -559,7 +638,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
     for attempt in 0..=MAX_RETRIES {
         rec.retries = attempt;
         let cluster = cluster_with_self(&gw);
-        let pick = match planner::pick(&cluster, &want, &gw.cfg.tiers, &exclude) {
+        let pick = match planner::pick(&cluster, &want, &gw.cfg.tiers, &exclude, api) {
             Ok(p) => p,
             Err(n) => {
                 let (code, msg) = no_pick_status(n);
@@ -569,10 +648,11 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
         rec.node_id = pick.pair.node_id.clone();
         rec.model_id = pick.pair.model_id.clone();
         rec.cold = pick.cold;
-        rec.active_params_b = cluster
+        let picked = cluster
             .get(&pick.pair.node_id)
-            .and_then(|v| v.state.models.iter().find(|m| m.id == pick.pair.model_id))
-            .and_then(|m| m.active_params_b);
+            .and_then(|v| v.state.models.iter().find(|m| m.id == pick.pair.model_id));
+        rec.active_params_b = picked.and_then(|m| m.active_params_b);
+        let slots = picked.map(|m| m.slots).unwrap_or(1);
         // Ім'я виконавця — для події `upstream_lost`; `cluster_with_self` містить і нас.
         let exec_name = cluster
             .get(&pick.pair.node_id)
@@ -631,12 +711,15 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
         }
 
         let mut up_body = body.clone();
-        prepare_upstream_body(&mut up_body, &pick.pair.model_id);
+        prepare_upstream_body(&mut up_body, &pick.pair.model_id, api);
+        if api == Api::Infill {
+            clamp_n_cmpl(&mut up_body, slots);
+        }
         let r = gw
             .http
             .post(format!("http://{}/exec", pick.addr))
             .timeout(EXEC_TIMEOUT)
-            .json(&serde_json::json!({"model": pick.pair.model_id, "body": up_body}))
+            .json(&serde_json::json!({"model": pick.pair.model_id, "api": api.as_str(), "body": up_body}))
             .send()
             .await;
         let up = match r {
@@ -652,10 +735,7 @@ async fn chat(State(gw): State<Gateway>, raw: Bytes) -> Response {
                         ChildErr::PassThrough => return pass_through(&gw, rec, started, u).await,
                         ChildErr::BadGateway => {
                             let body = read_capped(u, ERR_BODY_LIMIT).await;
-                            // Символи, не байти: зріз по байтах панікує на UTF-8.
-                            let text: String =
-                                String::from_utf8_lossy(&body).chars().take(200).collect();
-                            rec.error = Some(format!("child {code}: {text}"));
+                            rec.error = Some(child_error(code, &body));
                             return give_up(&gw, rec, started, 502, "upstream failed");
                         }
                     }
@@ -772,24 +852,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clamp_n_cmpl_caps_at_slots() {
+        let mut b = serde_json::json!({"n_cmpl": 3});
+        clamp_n_cmpl(&mut b, 1);
+        assert_eq!(b["n_cmpl"], 1);
+        let mut b = serde_json::json!({"n_cmpl": 2});
+        clamp_n_cmpl(&mut b, 4);
+        assert_eq!(b["n_cmpl"], 2);
+        let mut b = serde_json::json!({"input_prefix": "x"});
+        clamp_n_cmpl(&mut b, 1);
+        assert!(b.get("n_cmpl").is_none());
+        let mut b = serde_json::json!({"n_cmpl": "3"});
+        clamp_n_cmpl(&mut b, 1);
+        assert_eq!(b["n_cmpl"], "3");
+        let mut b = serde_json::json!({"n_cmpl": 3});
+        clamp_n_cmpl(&mut b, 0);
+        assert_eq!(b["n_cmpl"], 1);
+        let mut b = serde_json::json!([1, 2]);
+        clamp_n_cmpl(&mut b, 1);
+        assert_eq!(b, serde_json::json!([1, 2]));
+    }
+
+    #[test]
     fn injects_include_usage_only_for_stream() {
         let mut b = serde_json::json!({"model":"small","stream":true,"messages":[]});
-        prepare_upstream_body(&mut b, "qwen3-1b");
+        prepare_upstream_body(&mut b, "qwen3-1b", Api::Chat);
         assert_eq!(b["stream_options"]["include_usage"], true);
         assert_eq!(b["model"], "qwen3-1b");
         let mut b2 = serde_json::json!({"model":"small","messages":[]});
-        prepare_upstream_body(&mut b2, "qwen3-1b");
+        prepare_upstream_body(&mut b2, "qwen3-1b", Api::Chat);
         assert!(b2.get("stream_options").is_none());
         // Клієнт може прислати що завгодно: індексація Value панікує на не-об'єкті.
         let mut b3 = serde_json::json!({"model":"small","stream":true,"stream_options":5});
-        prepare_upstream_body(&mut b3, "qwen3-1b");
+        prepare_upstream_body(&mut b3, "qwen3-1b", Api::Chat);
         assert_eq!(
             b3["stream_options"],
             serde_json::json!({"include_usage": true})
         );
         let mut b4 = serde_json::json!([1, 2]);
-        prepare_upstream_body(&mut b4, "qwen3-1b");
+        prepare_upstream_body(&mut b4, "qwen3-1b", Api::Chat);
         assert_eq!(b4, serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn include_usage_for_chat_and_completions_not_infill() {
+        let mut b = serde_json::json!({"model":"small","stream":true,"prompt":"x"});
+        prepare_upstream_body(&mut b, "m", Api::Completions);
+        assert_eq!(b["stream_options"]["include_usage"], true);
+        let mut b = serde_json::json!({"stream":true,"input_prefix":"x"});
+        prepare_upstream_body(&mut b, "m", Api::Infill);
+        assert!(b.get("stream_options").is_none(), "{b}");
+        assert_eq!(b["model"], "m");
+    }
+
+    /// llama.vscode шле нативні поля llama.cpp — вони йдуть дитині як є.
+    #[test]
+    fn infill_body_keeps_native_fields() {
+        let mut b = serde_json::json!({
+            "id_slot": 0, "input_prefix": "a", "input_suffix": "b", "input_extra": [{"text": "c"}],
+            "n_predict": 0, "n_cmpl": 2, "cache_prompt": true, "t_max_prompt_ms": 500, "stream": false
+        });
+        let before = b.clone();
+        prepare_upstream_body(&mut b, "coder", Api::Infill);
+        b.as_object_mut().unwrap().remove("model");
+        assert_eq!(b, before);
+    }
+
+    #[test]
+    fn exec_request_without_api_is_chat() {
+        let r: ExecReq =
+            serde_json::from_value(serde_json::json!({"model":"m","body":{}})).unwrap();
+        assert_eq!(r.api, "chat");
+        let r: ExecReq =
+            serde_json::from_value(serde_json::json!({"model":"m","api":"infill","body":{}}))
+                .unwrap();
+        assert_eq!(Api::parse(&r.api), Some(Api::Infill));
     }
 
     #[test]
@@ -873,10 +1010,27 @@ mod tests {
         assert_eq!(no_pick_status(crate::planner::NoPick::UnknownModel).0, 400);
         assert_eq!(no_pick_status(crate::planner::NoPick::NoSuchTier).0, 503);
         assert_eq!(no_pick_status(crate::planner::NoPick::AllBusy).0, 503);
+        assert_eq!(
+            no_pick_status(crate::planner::NoPick::ApiUnsupported).0,
+            503
+        );
+    }
+
+    #[test]
+    fn child_error_cuts_by_chars_not_bytes() {
+        let body = "ї".repeat(201);
+        assert_eq!(
+            child_error(501, body.as_bytes()),
+            format!("child 501: {}", "ї".repeat(200))
+        );
+        assert_eq!(child_error(400, b"bad"), "child 400: bad");
     }
 
     #[test]
     fn child_errors_pass_through_retry_or_502() {
+        // 501 — дитина прямо каже «не вмію» (модель без FIM): інший вузол з тією самою
+        // моделлю не допоможе, клієнт має побачити причину.
+        assert_eq!(classify_child(501), ChildErr::PassThrough);
         assert_eq!(classify_child(400), ChildErr::PassThrough);
         assert_eq!(classify_child(413), ChildErr::PassThrough);
         // 503 у llama-server — «вантажиться/недоступний»: інший вузол може відповісти.

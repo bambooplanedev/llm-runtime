@@ -1,5 +1,5 @@
 use crate::config::Tiers;
-use crate::state::{Cluster, ModelState, PROTO};
+use crate::state::{Api, Cluster, ModelState, PROTO};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,8 @@ pub enum NoPick {
     UnknownModel,
     NoSuchTier,
     AllBusy,
+    /// Модель є, але лише на вузлах, що не вміють цього API (старіша версія llmrt).
+    ApiUnsupported,
 }
 
 pub const TIER_NAMES: [&str; 4] = ["small", "medium", "large", "auto"];
@@ -67,8 +69,10 @@ pub fn pick(
     want: &Want,
     tiers: &Tiers,
     exclude: &HashSet<Pair>,
+    api: Api,
 ) -> Result<Pick, NoPick> {
     let mut any_match = false;
+    let mut any_capable = false;
     let mut best: Option<(Pick, (u8, f64, i64))> = None;
     for (node_id, view) in cluster {
         if !view.alive || view.state.proto != PROTO {
@@ -83,6 +87,12 @@ pub fn pick(
                 continue;
             }
             any_match = true;
+            // До `exclude` і рангу, як і `any_match`: виключена чи зайнята пара на вузлі з API —
+            // це «зайнято», а не «онови вузол».
+            if !view.state.supports(api) {
+                continue;
+            }
+            any_capable = true;
             let pair = Pair {
                 node_id: node_id.clone(),
                 model_id: m.id.clone(),
@@ -128,6 +138,7 @@ pub fn pick(
             Want::Model(_) => NoPick::UnknownModel,
             Want::Tier(_) => NoPick::NoSuchTier,
         }),
+        None if !any_capable => Err(NoPick::ApiUnsupported),
         None => Err(NoPick::AllBusy),
     }
 }
@@ -187,6 +198,7 @@ mod tests {
                     models,
                     free_mb,
                     reclaimable_mb,
+                    apis: supported_apis(),
                     seen: 0,
                 },
             },
@@ -224,7 +236,7 @@ mod tests {
             vec![model("m8", 8.0, ModelState::Loaded, 6000, 0, 1)],
         )]);
         assert!(matches!(
-            pick(&c, &small(), &tiers(), &HashSet::new()),
+            pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat),
             Err(NoPick::NoSuchTier)
         ));
     }
@@ -243,7 +255,7 @@ mod tests {
                 vec![model("m1", 1.0, ModelState::Loaded, 1000, 0, 1)],
             ),
         ]);
-        let p = pick(&c, &small(), &tiers(), &HashSet::new()).unwrap();
+        let p = pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat).unwrap();
         assert_eq!(p.pair.node_id, "bb");
         assert!(!p.cold);
     }
@@ -263,7 +275,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            pick(&c, &small(), &tiers(), &HashSet::new())
+            pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat)
                 .unwrap()
                 .pair
                 .node_id,
@@ -286,7 +298,7 @@ mod tests {
             ), // 1-1 = 0
         ]);
         assert_eq!(
-            pick(&c, &small(), &tiers(), &HashSet::new())
+            pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat)
                 .unwrap()
                 .pair
                 .node_id,
@@ -302,7 +314,7 @@ mod tests {
             vec![model("m2", 2.0, ModelState::Available, 1500, 0, 1)],
         )]);
         assert!(matches!(
-            pick(&c, &small(), &tiers(), &HashSet::new()),
+            pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat),
             Err(NoPick::AllBusy)
         ));
     }
@@ -341,11 +353,11 @@ mod tests {
             model_id: "m1".into(),
         }]);
         assert!(matches!(
-            pick(&c, &small(), &tiers(), &ex),
+            pick(&c, &small(), &tiers(), &ex, Api::Chat),
             Err(NoPick::AllBusy)
         ));
         assert_eq!(
-            pick(&c, &small(), &tiers(), &HashSet::new())
+            pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat)
                 .unwrap()
                 .pair
                 .node_id,
@@ -368,7 +380,7 @@ mod tests {
                 vec![model("m1", 1.0, ModelState::Loading, 1000, 0, 1)],
             ),
         ]);
-        let p = pick(&c, &small(), &tiers(), &HashSet::new()).unwrap();
+        let p = pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat).unwrap();
         assert_eq!(p.pair.node_id, "bb");
         assert!(p.cold && p.joined);
 
@@ -384,7 +396,7 @@ mod tests {
                 vec![model("m1", 1.0, ModelState::Loaded, 1000, 0, 1)],
             ),
         ]);
-        let p = pick(&c, &small(), &tiers(), &HashSet::new()).unwrap();
+        let p = pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat).unwrap();
         assert_eq!(
             p.pair.node_id, "bb",
             "Loaded beats Loading even with fewer params"
@@ -408,14 +420,20 @@ mod tests {
         ]);
         let w = Want::Model("m8".into());
         assert_eq!(
-            pick(&c, &w, &tiers(), &HashSet::new())
+            pick(&c, &w, &tiers(), &HashSet::new(), Api::Chat)
                 .unwrap()
                 .pair
                 .node_id,
             "bb"
         );
         assert!(matches!(
-            pick(&c, &Want::Model("nope".into()), &tiers(), &HashSet::new()),
+            pick(
+                &c,
+                &Want::Model("nope".into()),
+                &tiers(),
+                &HashSet::new(),
+                Api::Chat
+            ),
             Err(NoPick::UnknownModel)
         ));
     }
@@ -437,7 +455,7 @@ mod tests {
             ),
         ]);
         let medium = Want::Tier(Tier::Medium);
-        let p = pick(&c, &medium, &tiers(), &HashSet::new()).unwrap();
+        let p = pick(&c, &medium, &tiers(), &HashSet::new(), Api::Chat).unwrap();
         assert_eq!(p.pair.model_id, "m4");
     }
 
@@ -450,7 +468,7 @@ mod tests {
             vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
         )]);
         let medium = Want::Tier(Tier::Medium);
-        let p = pick(&c, &medium, &tiers(), &HashSet::new()).unwrap();
+        let p = pick(&c, &medium, &tiers(), &HashSet::new(), Api::Chat).unwrap();
         assert_eq!(p.pair.model_id, "m9");
         assert!(p.cold, "the request starts the load itself");
         assert!(!p.joined);
@@ -467,7 +485,7 @@ mod tests {
             vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
         )]);
         assert!(matches!(
-            pick(&short, &medium, &tiers(), &HashSet::new()),
+            pick(&short, &medium, &tiers(), &HashSet::new(), Api::Chat),
             Err(NoPick::AllBusy)
         ));
         let without_field: Cluster = HashMap::from([node(
@@ -476,7 +494,101 @@ mod tests {
             vec![model("m9", 9.0, ModelState::Available, 6000, 0, 1)],
         )]);
         assert!(matches!(
-            pick(&without_field, &medium, &tiers(), &HashSet::new()),
+            pick(
+                &without_field,
+                &medium,
+                &tiers(),
+                &HashSet::new(),
+                Api::Chat
+            ),
+            Err(NoPick::AllBusy)
+        ));
+    }
+
+    /// Вузол старої версії: `/state` без `apis` читається як «лише chat».
+    fn chat_only(mut n: (String, NodeView)) -> (String, NodeView) {
+        n.1.state.apis = vec!["chat".into()];
+        n
+    }
+
+    #[test]
+    fn node_without_the_api_is_skipped() {
+        let c: Cluster = HashMap::from([
+            chat_only(node(
+                "a",
+                9000,
+                vec![model("m1", 1.0, ModelState::Loaded, 1000, 0, 1)],
+            )),
+            node(
+                "bb",
+                9000,
+                vec![model("m1", 1.0, ModelState::Available, 1000, 0, 1)],
+            ),
+        ]);
+        // Старий вузол має кращий ранг (loaded), але infill не вміє.
+        let p = pick(&c, &small(), &tiers(), &HashSet::new(), Api::Infill).unwrap();
+        assert_eq!(p.pair.node_id, "bb");
+        let p = pick(&c, &small(), &tiers(), &HashSet::new(), Api::Chat).unwrap();
+        assert_eq!(p.pair.node_id, "a");
+    }
+
+    #[test]
+    fn model_only_on_old_nodes_is_api_unsupported() {
+        let c: Cluster = HashMap::from([chat_only(node(
+            "a",
+            9000,
+            vec![model("m1", 1.0, ModelState::Loaded, 1000, 0, 1)],
+        ))]);
+        let ex = HashSet::new();
+        assert!(matches!(
+            pick(&c, &Want::Model("m1".into()), &tiers(), &ex, Api::Infill),
+            Err(NoPick::ApiUnsupported)
+        ));
+        assert!(matches!(
+            pick(&c, &small(), &tiers(), &ex, Api::Completions),
+            Err(NoPick::ApiUnsupported)
+        ));
+        assert!(matches!(
+            pick(&c, &Want::Model("nope".into()), &tiers(), &ex, Api::Infill),
+            Err(NoPick::UnknownModel)
+        ));
+    }
+
+    /// Вузол з API ставить прапорець до `exclude` і до рангу: виключена чи зайнята пара на ньому —
+    /// це «зайнято», а не «онови вузол».
+    #[test]
+    fn excluded_or_full_capable_pair_is_all_busy() {
+        let old = chat_only(node(
+            "a",
+            9000,
+            vec![model("m1", 1.0, ModelState::Loaded, 1000, 0, 1)],
+        ));
+        let c: Cluster = HashMap::from([
+            old.clone(),
+            node(
+                "bb",
+                9000,
+                vec![model("m1", 1.0, ModelState::Available, 1000, 0, 1)],
+            ),
+        ]);
+        let ex = HashSet::from([Pair {
+            node_id: "bb".into(),
+            model_id: "m1".into(),
+        }]);
+        assert!(matches!(
+            pick(&c, &small(), &tiers(), &ex, Api::Infill),
+            Err(NoPick::AllBusy)
+        ));
+        let c: Cluster = HashMap::from([
+            old,
+            node(
+                "bb",
+                0,
+                vec![model("m1", 1.0, ModelState::Available, 1000, 0, 1)],
+            ),
+        ]);
+        assert!(matches!(
+            pick(&c, &small(), &tiers(), &HashSet::new(), Api::Infill),
             Err(NoPick::AllBusy)
         ));
     }

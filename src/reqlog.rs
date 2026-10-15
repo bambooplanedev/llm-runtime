@@ -10,6 +10,8 @@ use std::sync::Mutex;
 pub struct Record {
     pub ts: u64,
     pub requested: String,
+    /// Який клієнтський API: `chat`, `completions`, `infill`.
+    pub api: crate::state::Api,
     pub node_id: String,
     pub model_id: String,
     pub active_params_b: Option<f64>,
@@ -80,15 +82,37 @@ impl ReqLog {
         warned
     }
 
-    /// Витягує `usage` і `timings` з фінального чанка стріму (llama.cpp).
+    /// Те саме для цілого non-stream тіла. Нативний `/infill` з `n_cmpl > 1` повертає масив:
+    /// промпт-токени й `timings` беремо з першого елемента, а токени генерації сумуємо по всіх.
+    pub fn fill_from_body(r: &mut Record, body: &serde_json::Value) {
+        let Some(items) = body.as_array() else {
+            Self::fill_from_final_chunk(r, body);
+            return;
+        };
+        if let Some(first) = items.first() {
+            Self::fill_from_final_chunk(r, first);
+        }
+        let counts: Vec<u64> = items
+            .iter()
+            .filter_map(|i| i.get("tokens_predicted").and_then(|v| v.as_u64()))
+            .collect();
+        if !counts.is_empty() {
+            r.completion_tokens = Some(counts.iter().sum());
+        }
+    }
+
+    /// Витягує токени (`usage` або `tokens_*`) і `timings` з фінального чанка стріму (llama.cpp).
     pub fn fill_from_final_chunk(r: &mut Record, chunk: &serde_json::Value) {
+        // `usage` — chat і completions; `tokens_*` — нативний `/infill` llama.cpp.
         r.prompt_tokens = chunk
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_u64())
+            .or_else(|| chunk.get("tokens_evaluated").and_then(|v| v.as_u64()))
             .or(r.prompt_tokens);
         r.completion_tokens = chunk
             .pointer("/usage/completion_tokens")
             .and_then(|v| v.as_u64())
+            .or_else(|| chunk.get("tokens_predicted").and_then(|v| v.as_u64()))
             .or(r.completion_tokens);
         r.predicted_ms = chunk
             .pointer("/timings/predicted_ms")
@@ -106,6 +130,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fills_from_an_array_body_summing_completion_tokens() {
+        let one = serde_json::json!({
+            "tokens_predicted": 4, "tokens_evaluated": 13,
+            "timings": {"predicted_ms": 16.0, "predicted_per_second": 125.0}
+        });
+        let arr = serde_json::json!([one, one, one]);
+        let mut r = Record::default();
+        ReqLog::fill_from_body(&mut r, &arr);
+        assert_eq!(r.prompt_tokens, Some(13));
+        assert_eq!(r.completion_tokens, Some(12));
+        assert_eq!(r.predicted_per_second, Some(125.0));
+
+        let mut r = Record::default();
+        ReqLog::fill_from_body(&mut r, &one);
+        assert_eq!(r.prompt_tokens, Some(13));
+        assert_eq!(r.completion_tokens, Some(4));
+    }
+
+    #[test]
     fn fills_usage_and_timings_from_last_chunk() {
         let chunk: serde_json::Value = serde_json::json!({
             "usage": {"prompt_tokens": 7, "completion_tokens": 5},
@@ -117,6 +160,36 @@ mod tests {
         assert_eq!(r.completion_tokens, Some(5));
         assert_eq!(r.predicted_per_second, Some(20.0));
         assert_eq!(r.predicted_ms, Some(250.0));
+    }
+
+    /// `/infill` llama.cpp не має `usage`: токени — у `tokens_evaluated`/`tokens_predicted`.
+    /// Якщо є обидва варіанти, перемагає `usage`.
+    #[test]
+    fn fills_tokens_from_an_infill_chunk_and_prefers_usage() {
+        let chunk = serde_json::json!({
+            "content": "", "stop": true, "tokens_predicted": 4, "tokens_evaluated": 13,
+            "timings": {"predicted_ms": 16.0, "predicted_per_second": 125.0}
+        });
+        let mut r = Record::default();
+        ReqLog::fill_from_final_chunk(&mut r, &chunk);
+        assert_eq!(r.prompt_tokens, Some(13));
+        assert_eq!(r.completion_tokens, Some(4));
+        assert_eq!(r.predicted_per_second, Some(125.0));
+
+        let both = serde_json::json!({
+            "usage": {"prompt_tokens": 7, "completion_tokens": 5},
+            "tokens_evaluated": 13, "tokens_predicted": 4
+        });
+        let mut r = Record::default();
+        ReqLog::fill_from_final_chunk(&mut r, &both);
+        assert_eq!(r.prompt_tokens, Some(7));
+        assert_eq!(r.completion_tokens, Some(5));
+
+        let r = Record {
+            api: crate::state::Api::Infill,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&r).unwrap()["api"], "infill");
     }
 
     #[test]

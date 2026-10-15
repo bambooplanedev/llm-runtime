@@ -4,6 +4,54 @@ use std::time::Instant;
 
 pub const PROTO: u32 = 2;
 
+/// Клієнтський API, який вузол обслуговує через `/exec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    #[default]
+    Chat,
+    Completions,
+    Infill,
+}
+
+impl Api {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Api::Chat => "chat",
+            Api::Completions => "completions",
+            Api::Infill => "infill",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Api> {
+        SUPPORTED_APIS.into_iter().find(|a| a.as_str() == s)
+    }
+
+    /// Шлях на дитині (llama-server). Довільного шляху `/exec` не приймає.
+    pub fn child_path(self) -> &'static str {
+        match self {
+            Api::Chat => "/v1/chat/completions",
+            Api::Completions => "/v1/completions",
+            Api::Infill => "/infill",
+        }
+    }
+}
+
+/// Що вміє цей вузол; оголошується в `/state`.
+pub const SUPPORTED_APIS: [Api; 3] = [Api::Chat, Api::Completions, Api::Infill];
+
+/// `SUPPORTED_APIS` у формі поля `NodeState.apis`.
+pub fn supported_apis() -> Vec<String> {
+    SUPPORTED_APIS
+        .iter()
+        .map(|a| a.as_str().to_string())
+        .collect()
+}
+
+fn chat_only() -> Vec<String> {
+    vec![Api::Chat.as_str().to_string()]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelState {
@@ -52,7 +100,17 @@ pub struct NodeState {
     /// Вузол без цього поля читається з 0 — «витісняти нічого».
     #[serde(default)]
     pub reclaimable_mb: u64,
+    /// API, які вузол обслуговує через `/exec`. Рядки, а не `Api`: невідоме значення від новішого
+    /// вузла не має валити розбір усього `/state`. Вузол без поля вміє лише chat.
+    #[serde(default = "chat_only")]
+    pub apis: Vec<String>,
     pub seen: u64,
+}
+
+impl NodeState {
+    pub fn supports(&self, api: Api) -> bool {
+        self.apis.iter().any(|s| s == api.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,5 +191,36 @@ mod tests {
         );
         let s: NodeState = serde_json::from_str(&with).unwrap();
         assert_eq!(s.reclaimable_mb, 6800);
+    }
+
+    /// Вузол без поля `apis` — старий: вміє лише chat. Невідоме значення від новішого вузла
+    /// не валить розбір і просто ні з чим не збігається.
+    #[test]
+    fn apis_default_to_chat_and_unknown_values_parse() {
+        let s: NodeState = serde_json::from_str(EXAMPLE).unwrap();
+        assert_eq!(s.apis, vec!["chat"]);
+        assert!(s.supports(Api::Chat));
+        assert!(!s.supports(Api::Infill));
+        let with = EXAMPLE.replace(
+            "\"free_mb\": 4100",
+            "\"free_mb\": 4100, \"apis\": [\"chat\", \"infill\", \"responses\"]",
+        );
+        let s: NodeState = serde_json::from_str(&with).unwrap();
+        assert!(s.supports(Api::Infill));
+        assert!(!s.supports(Api::Completions));
+    }
+
+    #[test]
+    fn api_names_paths_and_round_trip() {
+        for a in SUPPORTED_APIS {
+            assert_eq!(Api::parse(a.as_str()), Some(a));
+            assert_eq!(serde_json::to_value(a).unwrap(), a.as_str());
+        }
+        assert_eq!(Api::parse("responses"), None);
+        assert_eq!(Api::default(), Api::Chat);
+        assert_eq!(Api::Chat.child_path(), "/v1/chat/completions");
+        assert_eq!(Api::Completions.child_path(), "/v1/completions");
+        assert_eq!(Api::Infill.child_path(), "/infill");
+        assert_eq!(supported_apis(), vec!["chat", "completions", "infill"]);
     }
 }
